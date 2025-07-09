@@ -1,6 +1,6 @@
 # American and European Basket Option Pricing with Longstaff-Schwartz Method
 
-This project provides a comprehensive framework for pricing American and European basket options using the Longstaff-Schwartz (LSM) method with Monte Carlo simulation. It supports multiple correlated assets, flexible basket structures, and customizable regression bases for the LSM algorithm. The code is modular and extensible, making it easy to add new pricing methods, such as neural network-based regression, for comparison and research purposes.
+This project provides a comprehensive framework for pricing American and European basket options using the Longstaff-Schwartz (LSM) method with Monte Carlo simulation. It supports multiple correlated assets, flexible basket structures, and customizable regression bases for the LSM algorithm. The code is modular and extensible, making it easy to add new pricing methods, for comparison and research purposes.
 
 ## Features
 - **Correlated Geometric Brownian Motion (GBM) Simulation**: Simulate price paths for multiple assets with customizable covariance/correlation structures.
