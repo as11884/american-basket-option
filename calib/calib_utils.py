@@ -256,14 +256,14 @@ def create_parameter_bounds() -> List[Tuple[float, float]]:
     Returns
     -------
     List[Tuple[float, float]]
-        Parameter bounds in order: (v0, theta, kappa, sigma, rho)
+        Parameter bounds in order: (v0, kappa, theta, sigma, rho)
     """
     return [
-        (1e-6, 1.0),     # v0: initial variance
-        (1e-6, 1.0),     # theta: long-term variance
-        (0.01, 10.0),    # kappa: mean reversion speed
-        (0.01, 2.0),     # sigma: vol of vol
-        (-0.99, 0.99)    # rho: correlation
+        (1e-6, 2.0),     # v0: initial variance (allow up to 141% vol)
+        (0.1, 20.0),     # kappa: mean reversion speed (faster range)
+        (1e-6, 2.0),     # theta: long-term variance (allow up to 141% vol)
+        (0.01, 1.0),     # sigma: vol of vol (more conservative)
+        (-0.95, 0.95)    # rho: correlation (slightly less extreme)
     ]
 
 
