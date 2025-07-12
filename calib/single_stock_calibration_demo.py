@@ -2,7 +2,7 @@ import matplotlib.pyplot as plt
 from datetime import datetime
 
 # Import our calibration modules
-from market_data import prepare_calibration_data, filter_options_for_calibration
+from market_data import prepare_calibration_data
 from heston_calibrator import HestonCalibrator
 from calib_utils import HestonParams
 from heston_model import HestonModel
@@ -26,16 +26,10 @@ def calibrate_nvda():
     print(f"Spot price: {spot_price:.2f}", flush=True)
     print(f"Realized volatility (annualized): {realized_vol:.4f}", flush=True)
 
-    # 2) Filter option data for calibration
-    print("Filtering option data...", flush=True)
-    filtered_iv = filter_options_for_calibration(
-        iv_surface,
-        min_moneyness=0.8,
-        max_moneyness=1.2,
-        min_volume=10,
-        max_days_to_expiry=90
-    )
-    print(f"Using {len(filtered_iv)} options for calibration", flush=True)
+    # 2) Use all option data for calibration
+    print("Using all available option data for calibration...", flush=True)
+    option_data = iv_surface
+    print(f"Using {len(option_data)} options for calibration", flush=True)
 
     # 3) Initial parameter guess
     print("Setting initial parameters...", flush=True)
@@ -52,7 +46,7 @@ def calibrate_nvda():
     calibrator = HestonCalibrator(risk_free_rate=0.03)
     calibrated_params = calibrator.calibrate(
         spot_price=spot_price,
-        option_data=filtered_iv,
+        option_data=option_data,
         initial_parameters=init_params
     )
     print("Calibration complete.", flush=True)

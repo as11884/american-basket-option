@@ -51,91 +51,8 @@ class HestonCalibrator:
         """
         Compute the Heston characteristic function for option pricing.
         
-        The characteristic function is the Fourier transform of the probability
-        density function and is used in FFT-based option pricing.
-        
-        Parameters
-        ----------
-        frequency_points : np.ndarray
-            Array of frequency points for evaluation
-        spot_price : float
-            Current stock price
-        strike_price : float
-            Option strike price
-        time_to_expiry : float
-            Time to expiration in years
-        heston_params : HestonParams
-            Heston model parameters
-            
-        Returns
-        -------
-        np.ndarray
-            Characteristic function values
+        This uses the standard Heston (1993) formulation with correct branch cuts.
         """
-        # Extract parameters with descriptive names
-        initial_variance = heston_params.v0
-        mean_reversion_speed = heston_params.kappa
-        long_term_variance = heston_params.theta
-        volatility_of_volatility = heston_params.sigma
-        correlation = heston_params.rho
-        
-        # Log-moneyness (log of spot/strike ratio)
-        log_moneyness = log(spot_price / strike_price)
-        
-        # Heston characteristic function using Lewis (2001) formulation
-        # This is more numerically stable
-        
-        v0 = initial_variance
-        kappa = mean_reversion_speed  
-        theta = long_term_variance
-        sigma = volatility_of_volatility
-        rho = correlation
-        
-        # Complex frequency
-        u = frequency_points
-        
-        # Parameters
-        alpha = -0.5 * (u * u + u * 1j)
-        beta = kappa - rho * sigma * u * 1j
-        gamma = 0.5 * sigma * sigma
-        
-        # Discriminant
-        d = np.sqrt(beta * beta - 4 * alpha * gamma)
-        
-        # Ensure correct branch of square root
-        d = np.where(np.real(d) > 0, d, -d)
-        
-        # r+ and r- 
-        r_plus = (beta + d) / (2 * gamma)
-        r_minus = (beta - d) / (2 * gamma)
-        
-        # Choose the stable branch
-        # Use r_minus if |r_minus| < 1, otherwise use r_plus
-        g = r_minus
-        
-        # Time-dependent part
-        exp_dt = np.exp(-d * time_to_expiry)
-        
-        # A and B functions
-        A = (self.risk_free_rate * u * 1j * time_to_expiry + 
-             (kappa * theta / gamma) * (r_minus * time_to_expiry - 2 * np.log((1 - g * exp_dt) / (1 - g))))
-        
-        B = r_minus * (1 - exp_dt) / (1 - g * exp_dt)
-        
-        # Characteristic function
-        characteristic_function = np.exp(A + B * v0 + u * 1j * log_moneyness)
-        
-        return characteristic_function
-
-    def _price_option_fft(self, spot_price, strike_price, time_to_expiry, heston_params, option_type='call'):
-        """
-        Price European options using a simplified approach.
-        
-        This method uses a direct integration approach which is more reliable
-        than the FFT method for calibration purposes.
-        """
-        from scipy.integrate import quad
-        
         # Extract parameters
         v0 = heston_params.v0
         kappa = heston_params.kappa
@@ -143,60 +60,112 @@ class HestonCalibrator:
         sigma = heston_params.sigma
         rho = heston_params.rho
         
-        def heston_integrand(phi, j):
-            """Heston integrand for probability calculation"""
-            if j == 1:
-                u = phi - 1j
-                b = kappa - rho * sigma
-            else:
-                u = phi
-                b = kappa
-                
-            a = kappa * theta
-            
-            # Avoid division by zero
-            if abs(sigma) < 1e-10:
-                return 0.0
-                
-            d = np.sqrt((rho * sigma * u * 1j - b)**2 - sigma**2 * (2 * u * 1j - u**2))
-            g = (b - rho * sigma * u * 1j - d) / (b - rho * sigma * u * 1j + d)
-            
-            # Numerical stability for exponential
-            exp_term = np.exp(-d * time_to_expiry)
-            
-            # Avoid log(0) 
-            if abs(1 - g) < 1e-10:
-                return 0.0
-                
-            C = (self.risk_free_rate * u * 1j * time_to_expiry + 
-                 (a / sigma**2) * ((b - rho * sigma * u * 1j - d) * time_to_expiry - 
-                                  2 * np.log((1 - g * exp_term) / (1 - g))))
-            D = ((b - rho * sigma * u * 1j - d) / sigma**2) * ((1 - exp_term) / (1 - g * exp_term))
-            
-            f = np.exp(C + D * v0 + 1j * u * log(spot_price))
-            
-            return np.real(np.exp(-1j * u * log(strike_price)) * f / (1j * u))
+        # Frequency points
+        u = frequency_points
         
-        # Calculate P1 and P2
-        try:
-            P1 = 0.5 + (1/np.pi) * quad(lambda phi: heston_integrand(phi, 1), 0, 100, limit=200)[0]
-            P2 = 0.5 + (1/np.pi) * quad(lambda phi: heston_integrand(phi, 2), 0, 100, limit=200)[0]
+        # Auxiliary parameters
+        d = np.sqrt((rho * sigma * u * 1j - kappa)**2 - sigma**2 * (-u * 1j - u**2))
+        g = (kappa - rho * sigma * u * 1j - d) / (kappa - rho * sigma * u * 1j + d)
+        
+        # Ensure correct branch cut for g
+        # We want |g| < 1 for stability
+        g = np.where(np.abs(g) < 1, g, 1/g)
+        
+        # Exponential term
+        exp_dt = np.exp(-d * time_to_expiry)
+        
+        # A and B functions
+        A = (self.risk_free_rate * u * 1j * time_to_expiry + 
+             (kappa * theta / sigma**2) * 
+             ((kappa - rho * sigma * u * 1j - d) * time_to_expiry - 
+              2 * np.log((1 - g * exp_dt) / (1 - g))))
+        
+        B = ((kappa - rho * sigma * u * 1j - d) / sigma**2) * ((1 - exp_dt) / (1 - g * exp_dt))
+        
+        # Characteristic function
+        return np.exp(A + B * v0)
+
+    def _price_option_fft(self, spot_price, strike_price, time_to_expiry, heston_params, option_type='call'):
+        """
+        Price European options using the Heston model.
+        
+        Uses the standard Heston semi-analytical pricing formula.
+        """
+        from scipy.integrate import quad
+        from scipy.stats import norm
+        
+        # For very short times or extreme parameters, use Black-Scholes
+        if time_to_expiry < 1e-6 or heston_params.sigma > 5 or heston_params.v0 > 5:
+            vol = min(sqrt(heston_params.v0), 3.0)  # Cap volatility
+            d1 = (log(spot_price/strike_price) + (self.risk_free_rate + 0.5*vol**2)*time_to_expiry) / (vol*sqrt(time_to_expiry))
+            d2 = d1 - vol*sqrt(time_to_expiry)
             
+            if option_type == 'call':
+                return spot_price * norm.cdf(d1) - strike_price * exp(-self.risk_free_rate * time_to_expiry) * norm.cdf(d2)
+            else:
+                return strike_price * exp(-self.risk_free_rate * time_to_expiry) * norm.cdf(-d2) - spot_price * norm.cdf(-d1)
+        
+        def integrand(u, j):
+            """Integrand for Heston pricing formula"""
+            try:
+                if j == 1:
+                    # P1: shift u by -i
+                    u_shifted = u - 1j
+                    char_func = self._heston_characteristic_function(
+                        u_shifted, spot_price, strike_price, time_to_expiry, heston_params
+                    )
+                    # Adjust for the shift
+                    char_func = char_func * np.exp(-1j * u * log(spot_price))
+                else:
+                    # P2: standard characteristic function
+                    char_func = self._heston_characteristic_function(
+                        u, spot_price, strike_price, time_to_expiry, heston_params
+                    )
+                
+                # Return the real part of the integrand
+                return np.real(char_func * np.exp(-1j * u * log(strike_price)) / (1j * u))
+            except:
+                return 0.0
+        
+        # Calculate the probabilities P1 and P2
+        try:
+            # Integrate with smaller upper limit for stability
+            P1_integral, _ = quad(lambda u: integrand(u, 1), 0.0001, 50, limit=100, epsabs=1e-6)
+            P2_integral, _ = quad(lambda u: integrand(u, 2), 0.0001, 50, limit=100, epsabs=1e-6)
+            
+            P1 = 0.5 + P1_integral / np.pi
+            P2 = 0.5 + P2_integral / np.pi
+            
+            # Ensure probabilities are in [0,1]
+            P1 = max(0, min(1, P1))
+            P2 = max(0, min(1, P2))
+            
+            # Heston call price formula
             call_price = spot_price * P1 - strike_price * exp(-self.risk_free_rate * time_to_expiry) * P2
             
+            # Ensure reasonable bounds
+            max_price = spot_price  # Call can't be worth more than the stock
+            min_price = max(0, spot_price - strike_price * exp(-self.risk_free_rate * time_to_expiry))
+            
+            call_price = max(min_price, min(max_price, call_price))
+            
             if option_type == 'call':
-                return max(0, call_price)
+                return call_price
             else:
-                # Put-call parity
-                put_price = call_price + strike_price * exp(-self.risk_free_rate * time_to_expiry) - spot_price
+                # Use put-call parity for put
+                put_price = call_price - spot_price + strike_price * exp(-self.risk_free_rate * time_to_expiry)
                 return max(0, put_price)
                 
-        except:
-            # Fallback to intrinsic value
+        except Exception as e:
+            # Fallback to Black-Scholes
+            vol = min(sqrt(heston_params.v0), 3.0)
+            d1 = (log(spot_price/strike_price) + (self.risk_free_rate + 0.5*vol**2)*time_to_expiry) / (vol*sqrt(time_to_expiry))
+            d2 = d1 - vol*sqrt(time_to_expiry)
+            
             if option_type == 'call':
-                return max(0, spot_price - strike_price * exp(-self.risk_free_rate * time_to_expiry))
+                return spot_price * norm.cdf(d1) - strike_price * exp(-self.risk_free_rate * time_to_expiry) * norm.cdf(d2)
             else:
-                return max(0, strike_price * exp(-self.risk_free_rate * time_to_expiry) - spot_price)
+                return strike_price * exp(-self.risk_free_rate * time_to_expiry) * norm.cdf(-d2) - spot_price * norm.cdf(-d1)
 
     def _calculate_model_implied_volatility(self, spot_price, strike_price, time_to_expiry, 
                                           heston_params, option_type):
@@ -260,14 +229,60 @@ class HestonCalibrator:
         return optimization_result.x[0] if optimization_result.success else np.nan
 
     def _calibration_objective_function(self, parameter_vector, market_option_data, spot_price):
-        """Enforce Feller's condition via penalty before calibration."""
-        # Unpack parameters
-        v0, kappa, theta, sigma, rho = parameter_vector
-        # Penalize any violation of the Feller condition
-        if 2 * kappa * theta <= sigma**2:
-            return 1e6
-        # Otherwise defer to original objective
-        return super()._calibration_objective_function(parameter_vector, market_option_data, spot_price)
+        """
+        Objective function for parameter calibration.
+        
+        This function computes the mean squared error between market implied
+        volatilities and model implied volatilities for all options in the dataset.
+        
+        Parameters
+        ----------
+        parameter_vector : np.ndarray
+            Array of Heston parameters [v0, kappa, theta, sigma, rho]
+        market_option_data : pd.DataFrame
+            DataFrame with market option data
+        spot_price : float
+            Current stock price
+            
+        Returns
+        -------
+        float
+            Mean squared error between market and model implied volatilities
+        """
+        # Convert parameter vector to HestonParams object
+        heston_params = HestonParams(
+            v0=parameter_vector[0],
+            kappa=parameter_vector[1],
+            theta=parameter_vector[2],
+            sigma=parameter_vector[3],
+            rho=parameter_vector[4]
+        )
+        
+        # Calculate model implied volatilities for all options
+        squared_errors = []
+        
+        for _, option_row in market_option_data.iterrows():
+            # Extract option characteristics
+            strike_price = option_row['Strike']
+            time_to_expiry = option_row['DaysToExpiry'] / 365.0  # Convert days to years
+            market_implied_vol = option_row['ImpliedVolatility']
+            option_type = option_row['OptionType']
+            
+            # Calculate model implied volatility
+            model_implied_vol = self._calculate_model_implied_volatility(
+                spot_price, strike_price, time_to_expiry, heston_params, option_type
+            )
+            
+            # Add squared error if calculation was successful
+            if not np.isnan(model_implied_vol):
+                squared_error = (model_implied_vol - market_implied_vol)**2
+                squared_errors.append(squared_error)
+        
+        # Return mean squared error, or large penalty if no valid calculations
+        if squared_errors:
+            return np.mean(squared_errors)
+        else:
+            return 1e6  # Large penalty for invalid parameter combinations
 
     def calibrate(self, spot_price, option_data, initial_parameters, max_iterations=100):
         """

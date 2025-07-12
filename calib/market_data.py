@@ -9,7 +9,8 @@ needed for Heston model calibration, including:
 - Data preparation for calibration
 
 The module uses yfinance for data fetching and includes comprehensive
-error handling and data validation.
+error handling and data validation. All available option data is used
+without filtering to provide the complete market view.
 """
 
 import yfinance as yf
@@ -173,8 +174,8 @@ def calculate_implied_volatility_surface(historical_stock_data: pd.DataFrame,
     Calculate implied volatility surface from option chain data.
     
     This function processes option chain data to create a structured dataset
-    suitable for model calibration, including moneyness calculations and
-    data filtering.
+    suitable for model calibration, including moneyness calculations.
+    All available option data is included without filtering.
     
     Parameters
     ----------
@@ -190,13 +191,13 @@ def calculate_implied_volatility_surface(historical_stock_data: pd.DataFrame,
         - DaysToExpiry: Days until option expiration
         - Strike: Option strike price
         - Moneyness: Strike/Spot ratio
-        - ImpliedVolatility: Market implied volatility
+        - ImpliedVolatility: Market implied volatility (may include zero values)
         - OptionType: 'call' or 'put'
         
     Raises
     ------
     ValueError
-        If no valid implied volatility data is found
+        If no option data is found
     """
     print("Calculating implied volatility surface...")
     
@@ -212,41 +213,37 @@ def calculate_implied_volatility_surface(historical_stock_data: pd.DataFrame,
         calls_data = option_data['calls']
         puts_data = option_data['puts']
         
-        # Process call options
-        valid_calls = calls_data.dropna(subset=['impliedVolatility'])
-        for _, option_row in valid_calls.iterrows():
-            # Filter out options with zero or negative implied volatility
-            if option_row['impliedVolatility'] > 0:
-                implied_volatility_data.append({
-                    'DaysToExpiry': days_to_expiry,
-                    'Strike': option_row['strike'],
-                    'Moneyness': option_row['strike'] / current_spot_price,
-                    'ImpliedVolatility': option_row['impliedVolatility'],
-                    'OptionType': 'call',
-                    'Volume': option_row.get('volume', 0),
-                    'OpenInterest': option_row.get('openInterest', 0)
-                })
+        # Process call options - use all options without filtering
+        for _, option_row in calls_data.iterrows():
+            # Include all options, even those with zero or negative implied volatility
+            implied_volatility_data.append({
+                'DaysToExpiry': days_to_expiry,
+                'Strike': option_row['strike'],
+                'Moneyness': option_row['strike'] / current_spot_price,
+                'ImpliedVolatility': option_row.get('impliedVolatility', 0),  # Default to 0 if NaN
+                'OptionType': 'call',
+                'Volume': option_row.get('volume', 0),
+                'OpenInterest': option_row.get('openInterest', 0)
+            })
         
-        # Process put options
-        valid_puts = puts_data.dropna(subset=['impliedVolatility'])
-        for _, option_row in valid_puts.iterrows():
-            # Filter out options with zero or negative implied volatility
-            if option_row['impliedVolatility'] > 0:
-                implied_volatility_data.append({
-                    'DaysToExpiry': days_to_expiry,
-                    'Strike': option_row['strike'],
-                    'Moneyness': option_row['strike'] / current_spot_price,
-                    'ImpliedVolatility': option_row['impliedVolatility'],
-                    'OptionType': 'put',
-                    'Volume': option_row.get('volume', 0),
-                    'OpenInterest': option_row.get('openInterest', 0)
-                })
+        # Process put options - use all options without filtering
+        for _, option_row in puts_data.iterrows():
+            # Include all options, even those with zero or negative implied volatility
+            implied_volatility_data.append({
+                'DaysToExpiry': days_to_expiry,
+                'Strike': option_row['strike'],
+                'Moneyness': option_row['strike'] / current_spot_price,
+                'ImpliedVolatility': option_row.get('impliedVolatility', 0),  # Default to 0 if NaN
+                'OptionType': 'put',
+                'Volume': option_row.get('volume', 0),
+                'OpenInterest': option_row.get('openInterest', 0)
+            })
         
-        print(f"Processed {len(valid_calls)} calls and {len(valid_puts)} puts for {days_to_expiry} days to expiry")
+        print(f"Processed {len(calls_data)} calls and {len(puts_data)} puts for {days_to_expiry} days to expiry")
     
     # Create DataFrame from processed data
     if not implied_volatility_data:
-        raise ValueError("No valid implied volatility data found in option chains")
+        raise ValueError("No option data found in option chains")
     
     implied_vol_surface = pd.DataFrame(implied_volatility_data)
     
@@ -391,54 +388,6 @@ def prepare_calibration_data(ticker_symbol: str,
         raise
 
 
-def filter_options_for_calibration(iv_surface: pd.DataFrame,
-                                 min_moneyness: float = 0.8,
-                                 max_moneyness: float = 1.2,
-                                 min_volume: int = 10,
-                                 max_days_to_expiry: int = 180) -> pd.DataFrame:
-    """
-    Filter option data for calibration to improve robustness.
-    
-    This function applies various filters to remove illiquid or
-    problematic options that might hurt calibration quality.
-    
-    Parameters
-    ----------
-    iv_surface : pd.DataFrame
-        Implied volatility surface data
-    min_moneyness : float, default=0.8
-        Minimum moneyness (strike/spot) to include
-    max_moneyness : float, default=1.2
-        Maximum moneyness (strike/spot) to include
-    min_volume : int, default=10
-        Minimum trading volume to include
-    max_days_to_expiry : int, default=180
-        Maximum days to expiry to include
-        
-    Returns
-    -------
-    pd.DataFrame
-        Filtered implied volatility surface
-    """
-    print(f"Filtering options for calibration...")
-    print(f"Original dataset: {len(iv_surface)} options")
-    
-    # Apply filters
-    filtered_data = iv_surface[
-        (iv_surface['Moneyness'] >= min_moneyness) &
-        (iv_surface['Moneyness'] <= max_moneyness) &
-        (iv_surface['Volume'] >= min_volume) &
-        (iv_surface['DaysToExpiry'] <= max_days_to_expiry) &
-        (iv_surface['ImpliedVolatility'] > 0.05) &  # Remove extremely low IVs
-        (iv_surface['ImpliedVolatility'] < 2.0)     # Remove extremely high IVs
-    ].copy()
-    
-    print(f"Filtered dataset: {len(filtered_data)} options")
-    print(f"Removed {len(iv_surface) - len(filtered_data)} options due to filters")
-    
-    return filtered_data
-
-
 if __name__ == "__main__":
     """
     Example usage of the market data module.
@@ -458,9 +407,7 @@ if __name__ == "__main__":
         print("\nImplied Volatility Surface (sample):")
         print(calibration_data['iv_surface'].head(10))
         
-        # Apply filters
-        filtered_iv = filter_options_for_calibration(calibration_data['iv_surface'])
-        print(f"\nFiltered IV surface contains {len(filtered_iv)} options")
+        print(f"\nIV surface contains {len(calibration_data['iv_surface'])} options")
         
     except Exception as e:
         print(f"Error in example: {str(e)}")
