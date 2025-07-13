@@ -32,12 +32,6 @@ src/
 ├── demo/                                # Interactive demonstrations
 │   ├── quantlib_heston_demo.ipynb       # Heston calibration pipeline
 │   └── basket_option_pricing_demo.ipynb # American basket options demo
-├── calib/                               # Utilities and validation
-│   ├── heston_model.py                  # Direct Heston implementation
-│   ├── test_*.py                        # Numerical validation
-│   ├── calib_utils.py                   # Helper functions
-│   └── diagnose_calibration.py          # Diagnostics
-├── old_calib/                           # Legacy implementations
 ├── longstaff_schwartz.py                # LSM algorithm implementation
 └── basket_option_pricing_demo.ipynb     # Basket options demonstration
 ```
