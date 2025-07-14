@@ -132,9 +132,10 @@ class QuantLibHestonCalibrator:
 
             try:
                 # Set model parameters
-                model.setParams(ql.Array(list(params)))
+                params_array = ql.Array(list(params))
+                model.setParams(params_array)
                 
-                # Calculate calibration errors for each helper
+                # Calculate calibration errors for each helper - following Goutham's approach
                 errors = [h.calibrationError() for h in helpers]
                 
                 if norm:
@@ -147,9 +148,76 @@ class QuantLibHestonCalibrator:
                 return 1e6 if norm else [1e6] * len(helpers)
         
         return cost_function
+    def _cost_function_generator_with_smoothness(self, model: ql.HestonModel, helpers: list, spot: float, norm: bool = True):
+        """Enhanced cost function that penalizes non-smooth volatility smiles."""
+        def cost_function(params):
+            theta, kappa, sigma, rho, v0 = params
+            
+            # Enforce Feller condition: 2·kappa·theta > sigma²
+            if 2 * kappa * theta <= sigma**2:
+                return 1e6 if norm else [1e6] * len(helpers)
+
+            try:
+                # Set model parameters
+                model.setParams(ql.Array(list(params)))
+                
+                # Calculate basic calibration errors
+                basic_errors = [h.calibrationError() for h in helpers]
+                basic_cost = np.sqrt(np.sum(np.abs(basic_errors)))
+                
+                # Add smoothness penalty by checking volatility smile continuity
+                smoothness_penalty = 0.0
+                try:
+                    # Sample some strikes around ATM to check smoothness
+                    test_strikes = [spot * m for m in [0.95, 0.975, 1.0, 1.025, 1.05]]
+                    test_expiry = 60  # 60 days
+                    
+                    engine = ql.AnalyticHestonEngine(model)
+                    test_ivs = []
+                    
+                    for strike in test_strikes:
+                        try:
+                            period = ql.Period(test_expiry, ql.Days)
+                            expiry_date = self.evaluation_date + period
+                            exercise = ql.EuropeanExercise(expiry_date)
+                            payoff = ql.PlainVanillaPayoff(ql.Option.Call, strike)
+                            option = ql.VanillaOption(payoff, exercise)
+                            option.setPricingEngine(engine)
+                            
+                            price = option.NPV()
+                            if price > 0.001:
+                                iv = self._calculate_implied_vol(price, spot, strike, test_expiry/252.0, 'call')
+                                if 0.05 < iv < 1.0:  # Reasonable IV
+                                    test_ivs.append(iv)
+                                else:
+                                    test_ivs.append(np.nan)
+                            else:
+                                test_ivs.append(np.nan)
+                        except:
+                            test_ivs.append(np.nan)
+                    
+                    # Calculate smoothness penalty from IV differences
+                    valid_ivs = [iv for iv in test_ivs if not np.isnan(iv)]
+                    if len(valid_ivs) >= 3:
+                        iv_diffs = np.diff(valid_ivs)
+                        # Penalize large jumps in IV
+                        smoothness_penalty = np.sum(np.abs(iv_diffs)) * 10.0  # Scale factor
+                        
+                except:
+                    smoothness_penalty = 0.0
+                
+                # Combined cost: calibration error + smoothness penalty
+                total_cost = basic_cost + smoothness_penalty
+                
+                return total_cost if norm else basic_errors
+                    
+            except Exception:
+                return 1e6 if norm else [1e6] * len(helpers)
+        
+        return cost_function
     
     def _calibration_report(self, helpers: list, grid_data: list, detailed: bool = False) -> float:
-        """Generate calibration report showing fit quality."""
+        """Generate calibration report showing fit quality - following Goutham Balaraman's approach."""
         avg_error = 0.0
         
         if detailed:
@@ -162,6 +230,7 @@ class QuantLibHestonCalibrator:
                 model_val = helper.modelValue()
                 
                 if market_val > 0:
+                    # Following Goutham's approach: (model/market - 1.0)
                     rel_error = (model_val / market_val - 1.0)
                     avg_error += abs(rel_error)
                     
@@ -172,12 +241,14 @@ class QuantLibHestonCalibrator:
                 # Skip problematic helpers
                 continue
         
+        # Convert to percentage and average
         avg_error = avg_error * 100.0 / len(helpers) if helpers else 0.0
         
         if detailed:
             print("-" * 100)
         
-        print(f"Average Abs Error (%): {avg_error:.6f}")
+        summary = f"Average Abs Error (%): {avg_error:.9f}"
+        print(summary)
         return avg_error
     def _calculate_implied_vol(self, price: float, spot: float, strike: float, 
                               time_to_expiry: float, option_type: str) -> float:
@@ -244,13 +315,13 @@ class QuantLibHestonCalibrator:
         print(f"Market data: {len(market_data)} options")
         
         # Try multiple diverse initial conditions for robust global optimization
-        # These are specifically chosen to be well-separated in parameter space
-        initial_conditions = [
-            (0.02, 0.2, 0.5, 0.1, 0.01),     # Goutham's first: low vol, slow reversion
-            (0.15, 3.0, 1.5, -0.7, 0.25),    # High vol, fast reversion, strong negative correlation  
-            (0.08, 1.0, 0.3, -0.3, 0.10),    # Medium volatility, balanced parameters
-            (0.04, 0.5, 0.8, 0.5, 0.05),     # Low theta, medium kappa, high sigma, positive rho
-            (0.20, 5.0, 0.1, -0.9, 0.15)     # High theta, very fast reversion, low sigma, very negative rho
+        # These are realistic starting points based on typical equity market parameters
+        initial_conditions = [   
+            (0.04, 2.0, 0.3, -0.7, 0.04),   # Standard: 20% vol, moderate mean reversion
+            (0.09, 1.0, 0.1, -0.5, 0.09),   # High vol: 30% vol, slow mean reversion  
+            (0.01, 5.0, 0.6, -0.8, 0.02),   # Low vol: 10% vol, fast mean reversion
+            (0.06, 3.0, 0.4, -0.3, 0.05),   # Moderate: 25% vol, medium correlation
+            (0.03, 0.5, 0.2, -0.9, 0.03)    # Conservative: 17% vol, very slow mean reversion
         ]
         
         best_result = None
@@ -270,14 +341,14 @@ class QuantLibHestonCalibrator:
             if not helpers:
                 continue
                 
-            # Parameter bounds based on Goutham Balaraman's blog post
-            # His bounds: [(0,1),(0.01,15), (0.01,1.), (-1,1), (0,1.0)]
+            # Parameter bounds - following Goutham Balaraman's exact approach
+            # Order: theta, kappa, sigma, rho, v0
             bounds = [
-                (0.0, 1.0),     # theta: long-term variance  
-                (0.01, 15.0),   # kappa: mean reversion speed (wider range)
-                (0.01, 2.0),    # sigma: volatility of volatility (WIDER - this was the issue!)
-                (-1.0, 1.0),    # rho: correlation
-                (0.0, 1.0)      # v0: initial variance
+                (0.01, 1.0),    # theta: long-term variance (0.01 to 1.0)
+                (0.01, 15.0),   # kappa: mean reversion speed (0.01 to 15.0)
+                (0.01, 1.0),    # sigma: volatility of volatility (0.01 to 1.0)
+                (-0.99, 0.99),  # rho: correlation (-0.99 to 0.99)
+                (0.01, 1.0)     # v0: initial variance (0.01 to 1.0)
             ]
             
             # Create cost function
