@@ -1,5 +1,6 @@
 """
-QuantLib Heston Calibrator - Streamlined version for option model calibration.
+QuantLib Heston Calibrator - Using scipy differential evolution global optimizer.
+Based on Goutham Balaraman's approach: https://gouthamanbalaraman.com/blog/heston-calibration-scipy-optimize-quantlib-python.html
 """
 
 import numpy as np
@@ -7,6 +8,7 @@ import pandas as pd
 import QuantLib as ql
 from datetime import datetime, timedelta
 from typing import Optional, Tuple, Dict, Any
+from scipy.optimize import differential_evolution
 
 
 class QuantLibHestonCalibrator:
@@ -23,57 +25,160 @@ class QuantLibHestonCalibrator:
         ql.Settings.instance().evaluationDate = self.evaluation_date
         
         # Setup yield curves
-        self.rf_curve = ql.FlatForward(self.evaluation_date, self.r, ql.Actual365Fixed())
-        self.div_curve = ql.FlatForward(self.evaluation_date, self.q, ql.Actual365Fixed())
+        self.day_count = ql.Actual365Fixed()
+        self.rf_curve = ql.FlatForward(self.evaluation_date, self.r, self.day_count)
+        self.div_curve = ql.FlatForward(self.evaluation_date, self.q, self.day_count)
         
-    def _calculate_initial_parameters(self, market_data: pd.DataFrame, spot: float) -> Dict[str, float]:
-        """Estimate initial Heston parameters from market data."""
-        v0 = 0.04  # Default fallback 20% vol
+        # Create handles for the curves
+        self.yield_ts = ql.YieldTermStructureHandle(self.rf_curve)
+        self.dividend_ts = ql.YieldTermStructureHandle(self.div_curve)
         
-        try:
-            # Estimate volatility from ATM options using implied volatility
-            atm_data = market_data[
-                (market_data['Strike'] >= spot * 0.95) & 
-                (market_data['Strike'] <= spot * 1.05)
-            ]
-            
-            if not atm_data.empty:
-                # Calculate implied volatilities for ATM options
-                iv_values = []
-                for _, row in atm_data.iterrows():
-                    try:
-                        time_to_expiry = row.DaysToExpiry / 252.0
-                        iv = self._calculate_implied_vol(
-                            row.MarketPrice, spot, row.Strike, time_to_expiry, row.OptionType
-                        )
-                        iv_values.append(iv)
-                    except:
-                        continue
+    def _setup_model(self, spot: float, init_condition: Tuple[float, float, float, float, float] = (0.02, 0.2, 0.5, 0.1, 0.01)) -> Tuple[ql.HestonModel, ql.AnalyticHestonEngine]:
+        """Setup Heston model and engine with initial parameters."""
+        theta, kappa, sigma, rho, v0 = init_condition
+        
+        process = ql.HestonProcess(
+            self.yield_ts, 
+            self.dividend_ts,
+            ql.QuoteHandle(ql.SimpleQuote(spot)), 
+            v0, kappa, theta, sigma, rho
+        )
+        
+        model = ql.HestonModel(process)
+        engine = ql.AnalyticHestonEngine(model)
+        
+        return model, engine
+    
+    def _setup_helpers(self, engine: ql.AnalyticHestonEngine, market_data: pd.DataFrame, spot: float) -> Tuple[list, list]:
+        """Create QuantLib Heston helpers from market data - using Yahoo Finance IV directly."""
+        helpers = []
+        grid_data = []
+        
+        for _, row in market_data.iterrows():
+            try:
+                # Basic data quality filters
+                if (pd.isna(row.MarketPrice) or row.MarketPrice <= 0 or
+                    row.DaysToExpiry <= 0):
+                    continue
                 
-                if iv_values:
-                    avg_iv = np.mean(iv_values)
-                    v0 = avg_iv ** 2
-        except Exception:
-            pass  # Use fallback v0
+                # Use implied volatility from Yahoo Finance directly
+                if 'ImpliedVolatility' in row and pd.notna(row.ImpliedVolatility):
+                    impl_vol = float(row.ImpliedVolatility)
+                else:
+                    # Fallback: calculate IV if not available
+                    time_to_expiry = row.DaysToExpiry / 365.0
+                    impl_vol = self._calculate_implied_vol(
+                        row.MarketPrice, spot, row.Strike, time_to_expiry, row.OptionType
+                    )
+                
+                # IV filter - following Goutham's approach  
+                if impl_vol < 0.01 or impl_vol > 3.0:  # Wider range
+                    continue
+                
+                # Additional quality check: reasonable option price relative to intrinsic
+                is_call = row.OptionType.lower() == 'call'
+                intrinsic = max(0, (spot - row.Strike) if is_call else (row.Strike - spot))
+                
+                # Skip if market price is less than intrinsic (arbitrage)
+                if row.MarketPrice < intrinsic:
+                    continue
+                    
+                # Skip if time value is too small (may cause numerical issues)
+                time_value = row.MarketPrice - intrinsic
+                if time_value < 0.01:
+                    continue
+                
+                # Create QuantLib period and helper
+                period = ql.Period(int(row.DaysToExpiry), ql.Days)
+                
+                # Use the implied volatility directly like in Goutham's blog
+                helper = ql.HestonModelHelper(
+                    period,
+                    self.calendar,
+                    spot,                                    
+                    float(row.Strike),
+                    ql.QuoteHandle(ql.SimpleQuote(impl_vol)),  # Use Yahoo Finance IV or calculated IV
+                    self.yield_ts,
+                    self.dividend_ts
+                )
 
-        # Conservative parameter bounds
-        params = {
-            'v0': np.clip(v0, 0.01, 0.25),
-            'kappa': 1.5,
-            'theta': np.clip(v0 * 0.8, 0.01, 0.16),
-            'sigma': 0.3,
-            'rho': -0.7
-        }
+                helper.setPricingEngine(engine)
+                helpers.append(helper)
+                
+                # Store grid data for reporting
+                expiry_date = self.evaluation_date + period
+                grid_data.append((expiry_date, row.Strike))
+                
+            except Exception as e:
+                # More detailed error logging for debugging
+                continue
         
-        # Ensure Feller condition: 2*kappa*theta > sigma^2
-        while 2 * params['kappa'] * params['theta'] <= params['sigma']**2:
-            params['kappa'] *= 1.2
-            if params['kappa'] > 5.0:
-                params['sigma'] = 0.2
-                break
+        print(f"Created {len(helpers)} valid helpers from {len(market_data)} options")
         
-        return params
+        # Additional check: ensure we have enough helpers for calibration
+        if len(helpers) < 5:
+            print(f"Warning: Only {len(helpers)} helpers created - may not be sufficient for robust calibration")
         
+        return helpers, grid_data
+    
+    def _cost_function_generator(self, model: ql.HestonModel, helpers: list, norm: bool = True):
+        """Generate cost function for scipy optimization - based on Goutham Balaraman's approach."""
+        def cost_function(params):
+            theta, kappa, sigma, rho, v0 = params
+            
+            # Enforce Feller condition: 2·kappa·theta > sigma²
+            if 2 * kappa * theta <= sigma**2:
+                return 1e6 if norm else [1e6] * len(helpers)
+
+            try:
+                # Set model parameters
+                model.setParams(ql.Array(list(params)))
+                
+                # Calculate calibration errors for each helper
+                errors = [h.calibrationError() for h in helpers]
+                
+                if norm:
+                    # Following Goutham's approach: sqrt of sum of absolute errors
+                    return np.sqrt(np.sum(np.abs(errors)))
+                else:
+                    return errors
+                    
+            except Exception:
+                return 1e6 if norm else [1e6] * len(helpers)
+        
+        return cost_function
+    
+    def _calibration_report(self, helpers: list, grid_data: list, detailed: bool = False) -> float:
+        """Generate calibration report showing fit quality."""
+        avg_error = 0.0
+        
+        if detailed:
+            print(f"{'Strikes':<15} {'Expiry':<25} {'Market Value':<15} {'Model Value':<15} {'Relative Error (%)':<20}")
+            print("=" * 100)
+        
+        for i, helper in enumerate(helpers):
+            try:
+                market_val = helper.marketValue()
+                model_val = helper.modelValue()
+                
+                if market_val > 0:
+                    rel_error = (model_val / market_val - 1.0)
+                    avg_error += abs(rel_error)
+                    
+                    if detailed:
+                        date, strike = grid_data[i]
+                        print(f"{strike:<15.2f} {str(date):<25} {market_val:<14.5f} {model_val:<15.5f} {100.0 * rel_error:<20.7f}")
+            except:
+                # Skip problematic helpers
+                continue
+        
+        avg_error = avg_error * 100.0 / len(helpers) if helpers else 0.0
+        
+        if detailed:
+            print("-" * 100)
+        
+        print(f"Average Abs Error (%): {avg_error:.6f}")
+        return avg_error
     def _calculate_implied_vol(self, price: float, spot: float, strike: float, 
                               time_to_expiry: float, option_type: str) -> float:
         """Calculate implied volatility using QuantLib's built-in solver."""
@@ -84,21 +189,20 @@ class QuantLibHestonCalibrator:
             
             # Create Black-Scholes process for implied volatility calculation
             spot_handle = ql.QuoteHandle(ql.SimpleQuote(spot))
-            flat_ts = ql.YieldTermStructureHandle(self.rf_curve)
             flat_vol_ts = ql.BlackVolTermStructureHandle(
-                ql.BlackConstantVol(self.evaluation_date, self.calendar, 0.2, ql.Actual365Fixed())
+                ql.BlackConstantVol(self.evaluation_date, self.calendar, 0.2, self.day_count)
             )
             
             bsm_process = ql.BlackScholesMertonProcess(
                 spot_handle, 
-                ql.YieldTermStructureHandle(self.div_curve), 
-                flat_ts, 
+                self.dividend_ts, 
+                self.yield_ts, 
                 flat_vol_ts
             )
             
             # Create European option
-            period = ql.Period(int(time_to_expiry * 252), ql.Days)
-            expiry_date = self.evaluation_date + period
+            days_to_expiry = int(time_to_expiry * 365)
+            expiry_date = self.evaluation_date + ql.Period(days_to_expiry, ql.Days)
             exercise = ql.EuropeanExercise(expiry_date)
             payoff = ql.PlainVanillaPayoff(option_type_ql, float(strike))
             option = ql.VanillaOption(payoff, exercise)
@@ -115,228 +219,280 @@ class QuantLibHestonCalibrator:
         except Exception:
             # Fallback: simple approximation for ATM options
             return np.clip(price / (spot * 0.4), 0.05, 2.0)
-        
-    def _create_helpers(self, market_data: pd.DataFrame, spot: float, model: ql.HestonModel) -> list:
-        """Create QuantLib calibration helpers from market data using option prices."""
-        helpers = []
-        engine = ql.AnalyticHestonEngine(model)
-        valid_count = 0
-        
-        # Setup yield curve handles
-        rf_handle = ql.YieldTermStructureHandle(self.rf_curve)
-        div_handle = ql.YieldTermStructureHandle(self.div_curve)
-        
-        debug_counts = {'total': 0, 'basic_filter': 0, 'moneyness_filter': 0, 'price_filter': 0, 'iv_filter': 0, 'success': 0}
-        
-        for idx, (_, row) in enumerate(market_data.iterrows()):
-            debug_counts['total'] += 1
-            try:
-                # Basic data quality filters (less restrictive)
-                if (pd.isna(row.MarketPrice) or row.MarketPrice <= 0 or
-                    row.DaysToExpiry <= 0):
-                    debug_counts['basic_filter'] += 1
-                    continue
-                
-                # Moneyness filter: more lenient range  
-                moneyness = spot / row.Strike
-                if not (0.5 < moneyness < 2.0 and 5 <= row.DaysToExpiry <= 365):
-                    debug_counts['moneyness_filter'] += 1
-                    continue
-                
-                # Quality filters for implied volatility-based calibration
-                if row.MarketPrice < 0.10:  # Avoid very cheap options
-                    debug_counts['price_filter'] += 1
-                    continue
-                
-                # Calculate implied volatility
-                time_to_expiry = row.DaysToExpiry / 252.0
-                impl_vol = self._calculate_implied_vol(
-                    row.MarketPrice, spot, row.Strike, time_to_expiry, row.OptionType
-                )
-                
-                # Filter based on reasonable implied volatility range
-                if impl_vol < 0.05 or impl_vol > 2.0:
-                    debug_counts['iv_filter'] += 1
-                    continue
-                
-                # Create QuantLib period and Heston helper
-                period = ql.Period(int(row.DaysToExpiry), ql.Days)
-                helper = ql.HestonModelHelper(
-                    period, self.calendar, spot, float(row.Strike),
-                    ql.QuoteHandle(ql.SimpleQuote(impl_vol)),  # Use implied volatility
-                    rf_handle, div_handle
-                )
-                
-                helper.setPricingEngine(engine)
-                helpers.append(helper)
-                valid_count += 1
-                debug_counts['success'] += 1
-                
-            except Exception as e:
-                print(f"Failed to create helper for option {idx} (Strike={row.Strike}): {e}")
-                continue
-        
-        print(f"Debug counts: {debug_counts}")
-        
-        print(f"Created {valid_count} helpers from {len(market_data)} options using implied volatilities")
-        return helpers
-    
     def calibrate(self, spot: float, market_data: pd.DataFrame, 
-                 multi_start: bool = True) -> Tuple[ql.HestonModel, Dict[str, Any]]:
-        """Calibrate Heston model to market data using implied volatility approach."""
-        print(f"Starting Heston calibration for {len(market_data)} options using implied volatility...")
+                 maxiter: int = 100, detailed_report: bool = False) -> Tuple[ql.HestonModel, Dict[str, Any]]:
+        """
+        Calibrate Heston model using scipy differential evolution global optimizer.
         
-        # Get initial parameters
-        initial_params = self._calculate_initial_parameters(market_data, spot)
-        print(f"Initial params: v0={initial_params['v0']:.3f}, κ={initial_params['kappa']:.1f}, "
-              f"θ={initial_params['theta']:.3f}, σ={initial_params['sigma']:.1f}, ρ={initial_params['rho']:.1f}")
+        Parameters:
+        -----------
+        spot : float
+            Current stock price
+        market_data : pd.DataFrame
+            Market data with columns: Strike, MarketPrice, DaysToExpiry, OptionType
+        maxiter : int
+            Maximum iterations for differential evolution (default 100)
+        detailed_report : bool
+            Whether to print detailed calibration report
+            
+        Returns:
+        --------
+        Tuple[ql.HestonModel, Dict[str, Any]]
+            Calibrated model and calibration information
+        """
+        print(f"Starting Heston calibration using Differential Evolution...")
+        print(f"Market data: {len(market_data)} options")
         
-        # Create model
-        spot_handle = ql.QuoteHandle(ql.SimpleQuote(spot))
-        process = ql.HestonProcess(
-            ql.YieldTermStructureHandle(self.rf_curve),
-            ql.YieldTermStructureHandle(self.div_curve),
-            spot_handle,
-            initial_params['v0'], initial_params['kappa'], initial_params['theta'],
-            initial_params['sigma'], initial_params['rho']
-        )
-        model = ql.HestonModel(process)
-        
-        # Create helpers
-        helpers = self._create_helpers(market_data, spot, model)
-        if not helpers:
-            raise ValueError("No valid calibration helpers created")
-        
-        # Calibrate with multi-start if requested
-        best_model = model
-        best_error = float('inf')
-        best_params = None
-        
-        attempts = 3 if multi_start else 1
-        
-        for attempt in range(attempts):
-            try:
-                # Create fresh model for each attempt
-                if attempt > 0:
-                    # Slightly perturb initial parameters for multi-start
-                    perturbed_params = initial_params.copy()
-                    perturbed_params['v0'] *= (0.8 + 0.4 * np.random.random())
-                    perturbed_params['kappa'] *= (0.8 + 0.4 * np.random.random())
-                    perturbed_params['theta'] *= (0.8 + 0.4 * np.random.random())
-                    perturbed_params['sigma'] *= (0.8 + 0.4 * np.random.random())
-                    perturbed_params['rho'] = np.clip(
-                        perturbed_params['rho'] + 0.2 * (np.random.random() - 0.5), -0.99, 0.99
-                    )
-                    
-                    process = ql.HestonProcess(
-                        ql.YieldTermStructureHandle(self.rf_curve),
-                        ql.YieldTermStructureHandle(self.div_curve),
-                        spot_handle,
-                        perturbed_params['v0'], perturbed_params['kappa'], perturbed_params['theta'],
-                        perturbed_params['sigma'], perturbed_params['rho']
-                    )
-                    current_model = ql.HestonModel(process)
-                    
-                    # Update helpers with new model
-                    engine = ql.AnalyticHestonEngine(current_model)
-                    for helper in helpers:
-                        helper.setPricingEngine(engine)
-                else:
-                    current_model = model
-                
-                # Calibrate
-                optimizer = ql.LevenbergMarquardt()
-                end_criteria = ql.EndCriteria(1000, 500, 1e-8, 1e-8, 1e-8)
-                
-                current_model.calibrate(helpers, optimizer, end_criteria)
-                
-                # Calculate implied volatility errors (QuantLib calibrates on implied vol)
-                errors = []
-                for h in helpers:
-                    try:
-                        model_vol = h.impliedVolatility(h.modelValue(), 1e-6, 100, 0.01, 4.0)
-                        market_vol = h.volatility()
-                        errors.append(abs(model_vol - market_vol))
-                    except:
-                        errors.append(0.1)  # fallback error
-                avg_error = np.mean(errors)
-                
-                if avg_error < best_error:
-                    best_error = avg_error
-                    best_model = current_model
-                    best_params = current_model.params()
-                
-                if multi_start:
-                    print(f"  Attempt {attempt + 1}: avg error = {avg_error:.3f} (implied vol)")
-                
-            except Exception as e:
-                if multi_start:
-                    print(f"  Attempt {attempt + 1} failed: {e}")
-                continue
-        
-        if best_params is None:
-            return model, {'success': False, 'error': 'All calibration attempts failed'}
-        
-        # Validate best parameters
-        params = [
-            np.clip(best_params[0], 0.001, 1.0),    # v0
-            np.clip(best_params[1], 0.1, 20.0),     # kappa
-            np.clip(best_params[2], 0.001, 0.5),    # theta
-            np.clip(best_params[3], 0.01, 1.5),     # sigma
-            np.clip(best_params[4], -0.99, 0.99)    # rho
+        # Try multiple diverse initial conditions for robust global optimization
+        # These are specifically chosen to be well-separated in parameter space
+        initial_conditions = [
+            (0.02, 0.2, 0.5, 0.1, 0.01),     # Goutham's first: low vol, slow reversion
+            (0.15, 3.0, 1.5, -0.7, 0.25),    # High vol, fast reversion, strong negative correlation  
+            (0.08, 1.0, 0.3, -0.3, 0.10),    # Medium volatility, balanced parameters
+            (0.04, 0.5, 0.8, 0.5, 0.05),     # Low theta, medium kappa, high sigma, positive rho
+            (0.20, 5.0, 0.1, -0.9, 0.15)     # High theta, very fast reversion, low sigma, very negative rho
         ]
         
-        calibration_info = {
-            'success': True,
-            'calibrated_params': {
-                'v0': params[0], 'kappa': params[1], 'theta': params[2],
-                'sigma': params[3], 'rho': params[4]
-            },
-            'average_error': best_error,
-            'num_helpers': len(helpers),
-            'feller_satisfied': 2 * params[1] * params[2] > params[3]**2,
-            'multi_start_used': multi_start
-        }
+        best_result = None
+        best_cost = float('inf')
+        best_initial = None
         
-        if multi_start:
-            print(f"Multi-start calibration completed! Best avg error: {best_error:.3f} (implied vol)")
+        for init_condition in initial_conditions:
+            print(f"Trying initial condition: theta={init_condition[0]:.3f}, kappa={init_condition[1]:.3f}, "
+                  f"sigma={init_condition[2]:.3f}, rho={init_condition[3]:.3f}, v0={init_condition[4]:.3f}")
+            
+            # Setup model with this initial condition
+            model, engine = self._setup_model(spot, init_condition)
+            
+            # Create helpers for this setup
+            helpers, grid_data = self._setup_helpers(engine, market_data, spot)
+            
+            if not helpers:
+                continue
+                
+            # Parameter bounds based on Goutham Balaraman's blog post
+            # His bounds: [(0,1),(0.01,15), (0.01,1.), (-1,1), (0,1.0)]
+            bounds = [
+                (0.0, 1.0),     # theta: long-term variance  
+                (0.01, 15.0),   # kappa: mean reversion speed (wider range)
+                (0.01, 2.0),    # sigma: volatility of volatility (WIDER - this was the issue!)
+                (-1.0, 1.0),    # rho: correlation
+                (0.0, 1.0)      # v0: initial variance
+            ]
+            
+            # Create cost function
+            cost_function = self._cost_function_generator(model, helpers, norm=True)
+            
+            # Test the cost function with initial parameters to ensure it's working
+            initial_params = list(init_condition)
+            initial_cost = cost_function(initial_params)
+            print(f"  → Initial cost with these parameters: {initial_cost:.6f}")
+            
+            try:
+                # Run differential evolution with this initial condition
+                result = differential_evolution(
+                    cost_function, 
+                    bounds, 
+                    maxiter=maxiter,
+                    popsize=15,        # Slightly larger population
+                    seed=None,         # Random seed for variety
+                    atol=1e-6,         # Tighter tolerance
+                    tol=1e-6,          # Tighter tolerance  
+                    workers=1,         # Single threaded for stability
+                    polish=True        # Local optimization at the end
+                )
+                
+                # Accept result if cost is reasonable, even if maxiter exceeded
+                cost_acceptable = result.fun < 10.0  # Reasonable cost threshold
+                converged_well = result.fun < best_cost or best_cost == float('inf')
+                
+                print(f"  → Result: fun={result.fun:.6f}, nfev={result.nfev}, converged_well={converged_well}")
+                
+                if cost_acceptable and converged_well:
+                    best_result = result
+                    best_cost = result.fun
+                    best_initial = init_condition
+                    print(f"  → NEW BEST solution! Cost: {result.fun:.6f}")
+                else:
+                    print(f"  → Cost: {result.fun:.6f} (not improved from {best_cost:.6f})")
+                    
+            except Exception as e:
+                print(f"  → Exception: {str(e)}")
+                continue
+        
+        # Use the best result found
+        if best_result is None:
+            return model, {
+                'success': False,
+                'error': 'All initial conditions failed',
+                'calibrated_params': {},
+                'average_error': float('inf'),
+                'num_helpers': 0
+            }
+        
+        # Setup final model with best parameters
+        model, engine = self._setup_model(spot, best_initial)
+        helpers, grid_data = self._setup_helpers(engine, market_data, spot)
+        
+        # Now process the best result
+        result = best_result
+        
+        # Accept good solutions even if iteration limit was reached
+        cost_is_good = result.fun < 10.0  # Reasonable cost threshold
+        optimization_succeeded = result.success or cost_is_good
+        
+        if optimization_succeeded:
+            # Extract calibrated parameters
+            theta, kappa, sigma, rho, v0 = result.x
+            
+            # Set final parameters
+            model.setParams(ql.Array(list(result.x)))
+            
+            # Ensure Feller condition: 2*kappa*theta > sigma^2
+            feller_satisfied = 2 * kappa * theta > sigma**2
+            
+            # Calculate final calibration error
+            avg_error = self._calibration_report(helpers, grid_data, detailed=detailed_report)
+            
+            print(f"\nCalibration successful with initial condition: {best_initial}")
+            print(f"Iterations: {result.nit}, Function evaluations: {result.nfev}")
+            print(f"Final cost: {result.fun:.6f}")
+            
+            calibration_info = {
+                'success': True,
+                'calibrated_params': {
+                    'theta': theta,
+                    'kappa': kappa, 
+                    'sigma': sigma,
+                    'rho': rho,
+                    'v0': v0
+                },
+                'average_error': avg_error,
+                'num_helpers': len(helpers),
+                'feller_satisfied': feller_satisfied,
+                'best_initial_condition': best_initial,
+                'multi_start_used': True,
+                'optimization_result': {
+                    'fun': result.fun,
+                    'nit': result.nit,
+                    'nfev': result.nfev,
+                    'message': result.message
+                }
+            }
+            
         else:
-            print(f"Calibration completed! Avg error: {best_error:.3f} (implied vol)")
-        
-        return best_model, calibration_info
-    
+            calibration_info = {
+                'success': False,
+                'error': f"Optimization failed: {result.message}",
+                'calibrated_params': {},
+                'average_error': float('inf'),
+                'num_helpers': len(helpers) if helpers else 0,
+                'best_initial_condition': best_initial,
+                'multi_start_used': True
+            }
+            print(f"Calibration failed: {result.message}")
+                
+        return model, calibration_info
     def print_results(self, calibration_info: Dict[str, Any]):
-        """Print calibration results in a concise format."""
+        """Print calibration results in a formatted table."""
         if not calibration_info['success']:
-            print(f"Calibration failed: {calibration_info['error']}")
+            print(f"Calibration failed: {calibration_info.get('error', 'Unknown error')}")
             return
             
         params = calibration_info['calibrated_params']
-        multi_start = calibration_info.get('multi_start_used', False)
         
-        print(f"HESTON CALIBRATION RESULTS")
-        print(f"{'='*50}")
-        print(f"Method:          Implied Volatility (HestonModelHelper)")
-        if multi_start:
-            print(f"Multi-start:     ✓ (3 attempts)")
-        print(f"Initial vol:     {np.sqrt(params['v0']):.1%}")
-        print(f"Long-term vol:   {np.sqrt(params['theta']):.1%}")
-        print(f"Mean reversion:  {params['kappa']:.1f}")
-        print(f"Vol-of-vol:      {params['sigma']:.1%}")
-        print(f"Correlation:     {params['rho']:.2f}")
-        print(f"Avg error:       {calibration_info['average_error']:.3f} (implied vol)")
-        print(f"Options used:    {calibration_info['num_helpers']}")
-        print(f"Feller condition: {'✓' if calibration_info['feller_satisfied'] else '✗'}")
+        print(f"\nHESTON CALIBRATION RESULTS")
+        print(f"{'='*60}")
+        print(f"Method:            Differential Evolution (Global Optimizer)")
+        print(f"Multi-start:       {'Yes' if calibration_info.get('multi_start_used', False) else 'No'}")
+        if 'best_initial_condition' in calibration_info:
+            best_init = calibration_info['best_initial_condition']
+            print(f"Best initial:      θ={best_init[0]:.3f}, κ={best_init[1]:.3f}, σ={best_init[2]:.3f}, ρ={best_init[3]:.3f}, v₀={best_init[4]:.3f}")
+        print(f"Options used:      {calibration_info['num_helpers']}")
+        print(f"Average error:     {calibration_info['average_error']:.6f}%")
+        print(f"\nCalibrated Parameters:")
+        print(f"{'='*60}")
+        print(f"theta (θ):         {params['theta']:.6f}  (long-term variance)")
+        print(f"kappa (κ):         {params['kappa']:.6f}  (mean reversion speed)")
+        print(f"sigma (σ):         {params['sigma']:.6f}  (vol of vol)")
+        print(f"rho (ρ):           {params['rho']:.6f}  (correlation)")
+        print(f"v0:                {params['v0']:.6f}  (initial variance)")
+        print(f"\nDerived Metrics:")
+        print(f"{'='*60}")
+        print(f"Initial vol:       {np.sqrt(params['v0']):.2%}")
+        print(f"Long-term vol:     {np.sqrt(params['theta']):.2%}")
+        print(f"Feller condition:  {'✓ Satisfied' if calibration_info['feller_satisfied'] else '✗ Violated'}")
+        
+        # Show optimization details if available
+        if 'optimization_result' in calibration_info:
+            opt_result = calibration_info['optimization_result']
+            print(f"\nOptimization Details:")
+            print(f"{'='*60}")
+            print(f"Iterations:        {opt_result.get('nit', 'N/A')}")
+            print(f"Function evals:    {opt_result.get('nfev', 'N/A')}")
+            print(f"Final cost:        {opt_result.get('fun', 'N/A'):.6f}")
+            print(f"Status:            {opt_result.get('message', 'N/A')}")
 
 
 # Quick test
 if __name__ == '__main__':
-    from market_data_fetcher import MarketDataFetcher
-    
-    fetcher = MarketDataFetcher(ticker='NVDA', expiry_list=['1M', '3M'], atm_range=0.15)
-    market_data = fetcher.prepare_market_data()
-    spot = fetcher.get_spot_price()
-    
-    calibrator = QuantLibHestonCalibrator(r=0.015, q=0.0)
-    model, info = calibrator.calibrate(spot, market_data)
-    calibrator.print_results(info)
+    # Test the calibrator
+    try:
+        from market_data_fetcher import MarketDataFetcher
+        
+        print("Testing QuantLib Heston Calibrator with Differential Evolution...")
+        
+        # Fetch market data
+        fetcher = MarketDataFetcher(ticker='NVDA', expiry_list=['1M', '2M'], atm_range=0.15)
+        market_data = fetcher.prepare_market_data()
+        spot = fetcher.get_spot_price()
+        
+        print(f"Spot price: ${spot:.2f}")
+        print(f"Market data shape: {market_data.shape}")
+        
+        # Create and run calibrator with more generous settings
+        calibrator = QuantLibHestonCalibrator(r=0.015, q=0.0)
+        model, info = calibrator.calibrate(
+            spot=spot, 
+            market_data=market_data, 
+            maxiter=150,  # More iterations for real data
+            detailed_report=False
+        )
+        
+        # Print results
+        calibrator.print_results(info)
+        
+    except ImportError:
+        print("MarketDataFetcher not available. Running with synthetic data...")
+        
+        # Create simple synthetic data as fallback
+        import pandas as pd
+        
+        spot = 100.0
+        synthetic_data = pd.DataFrame([
+            {'Strike': 95.0, 'MarketPrice': 6.50, 'DaysToExpiry': 30, 'OptionType': 'call', 'ImpliedVolatility': 0.22},
+            {'Strike': 100.0, 'MarketPrice': 3.20, 'DaysToExpiry': 30, 'OptionType': 'call', 'ImpliedVolatility': 0.20},
+            {'Strike': 105.0, 'MarketPrice': 1.10, 'DaysToExpiry': 30, 'OptionType': 'call', 'ImpliedVolatility': 0.25},
+            {'Strike': 95.0, 'MarketPrice': 8.70, 'DaysToExpiry': 90, 'OptionType': 'call', 'ImpliedVolatility': 0.24},
+            {'Strike': 100.0, 'MarketPrice': 5.80, 'DaysToExpiry': 90, 'OptionType': 'call', 'ImpliedVolatility': 0.22},
+            {'Strike': 105.0, 'MarketPrice': 3.50, 'DaysToExpiry': 90, 'OptionType': 'call', 'ImpliedVolatility': 0.26},
+        ])
+        
+        print(f"Using synthetic data with {len(synthetic_data)} options")
+        print(f"Spot price: ${spot:.2f}")
+        
+        # Test with synthetic data
+        calibrator = QuantLibHestonCalibrator(r=0.02, q=0.0)
+        model, info = calibrator.calibrate(
+            spot=spot,
+            market_data=synthetic_data,
+            maxiter=200,  # More iterations for proper convergence
+            detailed_report=False
+        )
+        
+        calibrator.print_results(info)
+        
+    except Exception as e:
+        print(f"Test failed: {e}")
+        import traceback
+        traceback.print_exc()

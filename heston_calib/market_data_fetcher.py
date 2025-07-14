@@ -163,6 +163,7 @@ class MarketDataFetcher:
                         df['Strike'] = df['strike']
                         df['Spread'] = df['ask'] - df['bid']
                         df['SpreadPct'] = df['Spread'] / df['MarketPrice'].replace(0, np.nan)
+                        df['ImpliedVolatility'] = df['impliedVolatility']  # Yahoo Finance IV
                         
                         rows.append(df)
                         print(f"  Fetched {len(df)} contracts for {exp_str}")
@@ -187,6 +188,7 @@ class MarketDataFetcher:
                     df['Strike'] = df['strike']
                     df['Spread'] = df['ask'] - df['bid']
                     df['SpreadPct'] = df['Spread'] / df['MarketPrice'].replace(0, np.nan)
+                    df['ImpliedVolatility'] = df['impliedVolatility']  # Yahoo Finance IV
                     
                     rows.append(df)
                 
@@ -261,7 +263,7 @@ class MarketDataFetcher:
         if atm_filtered.empty:
             return pd.DataFrame()
         
-        final_df = atm_filtered[['OptionType', 'Strike', 'DaysToExpiry', 'MarketPrice']].copy()
+        final_df = atm_filtered[['OptionType', 'Strike', 'DaysToExpiry', 'MarketPrice', 'ImpliedVolatility']].copy()
         
         print(f"Final dataset: {len(final_df)} contracts across {final_df['DaysToExpiry'].nunique()} maturities")
         print(f"DTE range: {final_df['DaysToExpiry'].min()} to {final_df['DaysToExpiry'].max()} days")
