@@ -161,8 +161,6 @@ class MarketDataFetcher:
                         df['DaysToExpiry'] = (df['ExpirationDate'] - today).dt.days
                         df['MarketPrice'] = (df['bid'] + df['ask']) / 2.0
                         df['Strike'] = df['strike']
-                        df['Spread'] = df['ask'] - df['bid']
-                        df['SpreadPct'] = df['Spread'] / df['MarketPrice'].replace(0, np.nan)
                         df['ImpliedVolatility'] = df['impliedVolatility']  # Yahoo Finance IV
                         
                         rows.append(df)
@@ -186,8 +184,6 @@ class MarketDataFetcher:
                     df['DaysToExpiry'] = (df['ExpirationDate'] - today).dt.days
                     df['MarketPrice'] = (df['bid'] + df['ask']) / 2.0
                     df['Strike'] = df['strike']
-                    df['Spread'] = df['ask'] - df['bid']
-                    df['SpreadPct'] = df['Spread'] / df['MarketPrice'].replace(0, np.nan)
                     df['ImpliedVolatility'] = df['impliedVolatility']  # Yahoo Finance IV
                     
                     rows.append(df)
@@ -204,26 +200,6 @@ class MarketDataFetcher:
         
         return all_data
     
-    def apply_quality_filters(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Apply quality filters to remove bad option data."""
-        if df.empty:
-            return df
-            
-        print("Applying quality filters...")
-        initial_count = len(df)
-        
-        df_filtered = df[
-            (df['volume'] > 0) &
-            (df['bid'] > 0) & (df['ask'] > 0) &
-            (df['DaysToExpiry'] > 0) &
-            (df['DaysToExpiry'] <= 365) &
-            (df['MarketPrice'] > 0.01) &
-            (df['SpreadPct'] <= 0.5) &
-            (df['openInterest'] >= 1)
-        ].copy()
-        
-        print(f"Quality filters removed {initial_count - len(df_filtered)} contracts")
-        return df_filtered
     
     def apply_atm_filter(self, df: pd.DataFrame) -> pd.DataFrame:
         """Keep only options near ATM."""
@@ -254,12 +230,8 @@ class MarketDataFetcher:
         raw_data = self.fetch_raw_option_data()
         if raw_data.empty:
             return pd.DataFrame()
-        
-        quality_filtered = self.apply_quality_filters(raw_data)
-        if quality_filtered.empty:
-            return pd.DataFrame()
-        
-        atm_filtered = self.apply_atm_filter(quality_filtered)
+
+        atm_filtered = self.apply_atm_filter(raw_data)
         if atm_filtered.empty:
             return pd.DataFrame()
         
@@ -289,7 +261,7 @@ class MarketDataFetcher:
 
 # Quick test
 if __name__ == '__main__':
-    fetcher = MarketDataFetcher(ticker='NVDA', expiry_list=['1M', '3M'], atm_range=0.4)
+    fetcher = MarketDataFetcher(ticker='NVDA', expiry_list=['1M', '3M'], atm_range=0.1)
     data = fetcher.prepare_market_data()
     
     if not data.empty:
@@ -297,5 +269,6 @@ if __name__ == '__main__':
         print(f"\n📊 Summary: {stats['total_contracts']} contracts, "
               f"{stats['unique_maturities']} maturities, "
               f"DTE: {stats['dte_range'][0]}-{stats['dte_range'][1]} days")
+        print(data.head())
     else:
         print("No data found")
