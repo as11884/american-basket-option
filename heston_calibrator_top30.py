@@ -37,9 +37,9 @@ STOCKS = [
     'BA', 'CAT', 'GE', 'XOM', 'CVX', 'V'
 ]
 
-EXPIRIES = ['1M', '2M']                      # Option expiries to use
-ATM_RANGE = 0.10                             # ±10% around spot price (tighter for better quality)
-PARALLEL_WORKERS = 4                         # More workers for 30 stocks
+EXPIRIES = ['1M', '2M', '3M']                # Option expiries to use
+ATM_RANGE = 0.1                              # ±10% around spot price (tighter for better quality)
+PARALLEL_WORKERS = 8                         # More workers for 30 stocks
 
 # Add project paths
 project_root = r'C:\Users\Ao Shen\Desktop\mfin research\src'
@@ -50,14 +50,11 @@ for path in [project_root, heston_path]:
         sys.path.insert(0, path)
 
 # Import required modules
-try:
-    from market_data_fetcher import MarketDataFetcher
-    from quantlib_heston_calibrator import QuantLibHestonCalibrator
-    import QuantLib as ql
-except ImportError as e:
-    print(f"❌ Import error: {e}")
-    print("Please ensure you're running from the correct directory")
-    sys.exit(1)
+from market_data_fetcher import MarketDataFetcher
+from quantlib_heston_calibrator import QuantLibHestonCalibrator
+from covariance_estimator import CovarianceEstimator
+import QuantLib as ql
+
 
 warnings.filterwarnings('ignore')
 
@@ -72,11 +69,8 @@ def calibrate_stock(ticker):
         market_data = fetcher.prepare_market_data()
         spot_price = fetcher.get_spot_price()
         
-        if len(market_data) < 10:
-            return {'ticker': ticker, 'success': False, 'error': 'Insufficient data'}
-        
         # Calibrate
-        calibrator = QuantLibHestonCalibrator(r=0.04, q=0.0)
+        calibrator = QuantLibHestonCalibrator(r=0.05, q=0.0)
         heston_model, info = calibrator.calibrate(
             spot=spot_price, 
             market_data=market_data, 
@@ -111,7 +105,7 @@ def calibrate_stock(ticker):
 
 def main():
     """Main calibration function for top 30 stocks."""
-    print("🚀 TOP 30 STOCKS HESTON CALIBRATION")
+    print("TOP 30 STOCKS HESTON CALIBRATION")
     print("=" * 80)
     print(f"Target: {len(STOCKS)} major US stocks (existing since 2017)")
     print(f"Stocks: {STOCKS[:10]}... (showing first 10)")
@@ -142,11 +136,11 @@ def main():
     successful = [r for r in results if r['success']]
     failed = [r for r in results if not r['success']]
     
-    print(f"\n⏱️  Total time: {time.time() - start_time:.1f} seconds")
-    print(f"✅ Successful: {len(successful)}/{len(STOCKS)}")
+    print(f"\n Total time: {time.time() - start_time:.1f} seconds")
+    print(f" Successful: {len(successful)}/{len(STOCKS)}")
     
     if failed:
-        print(f"❌ Failed stocks: {[f['ticker'] for f in failed]}")
+        print(f"Failed stocks: {[f['ticker'] for f in failed]}")
         for f in failed:
             print(f"   • {f['ticker']}: {f['error']}")
     
@@ -154,7 +148,7 @@ def main():
         print("No successful calibrations to analyze.")
         return
 
-    print("\n📊 CALIBRATION RESULTS")
+    print("\n CALIBRATION RESULTS")
     print("=" * 80)
     
     # Export comprehensive results
@@ -180,70 +174,42 @@ def main():
     
     raw_params_df = pd.DataFrame(raw_params)
     
-    # 2. Save parameter correlation matrix
-    param_corr_matrix = raw_params_df[['v0', 'theta', 'kappa', 'sigma', 'rho']].T.corr()
-    param_corr_matrix.index = raw_params_df['Ticker']
-    param_corr_matrix.columns = raw_params_df['Ticker']
+    # 2. Calculate ACTUAL stock correlation matrix using historical returns
+    print("📊 Calculating stock correlation matrix from historical returns...")
+    successful_tickers = [r['ticker'] for r in successful]
+    
+    try:
+        corr_estimator = CovarianceEstimator(successful_tickers, lookback_days=90)
+        corr_estimator.fetch_price_data()
+        corr_estimator.calculate_returns()
+        stock_corr_matrix = corr_estimator.get_correlation_matrix()
+        
+        # Convert to DataFrame for better handling
+        stock_corr_df = pd.DataFrame(
+            stock_corr_matrix, 
+            index=successful_tickers, 
+            columns=successful_tickers
+        )
+        
+        print(f"Stock correlation matrix calculated using 1-year historical returns")
+        
+    except Exception as e:
+        print(f"Failed to calculate stock correlations: {e}")
+        print("Creating identity matrix as fallback...")
+        stock_corr_df = pd.DataFrame(
+            np.eye(len(successful_tickers)), 
+            index=successful_tickers, 
+            columns=successful_tickers
+        )
     
     # Save files with clean names
     raw_params_df.to_csv('heston_parameters.csv', index=False)
-    param_corr_matrix.to_csv('heston_correlation_matrix.csv')
-    
-    print(f"\n💾 RESULTS SAVED:")
-    print(f"   • Heston Parameters: heston_parameters.csv")
-    print(f"   • Correlation Matrix: heston_correlation_matrix.csv")
-    
-    # Display correlation matrix summary
-    print(f"\n🔗 PARAMETER CORRELATION MATRIX SUMMARY")
-    print("=" * 80)
-    print(f"Highest correlated parameters:")
-    
-    # Find highest correlations (excluding diagonal)
-    corr_flat = param_corr_matrix.values
-    np.fill_diagonal(corr_flat, 0)  # Remove diagonal
-    max_corr_idx = np.unravel_index(np.argmax(np.abs(corr_flat)), corr_flat.shape)
-    max_corr = corr_flat[max_corr_idx]
-    
-    param_names = param_corr_matrix.columns.tolist()
-    print(f"   • {param_names[max_corr_idx[0]]} vs {param_names[max_corr_idx[1]]}: {max_corr:.3f}")
-    
-    # Show average correlations
-    mean_corr = np.mean(np.abs(corr_flat[corr_flat != 0]))
-    print(f"   • Average absolute correlation: {mean_corr:.3f}")
-    
-    # Market analysis using raw parameters
-    print(f"\n📈 MARKET ANALYSIS - TOP 30 STOCKS")
-    print("=" * 80)
-    print(f"Successfully calibrated: {len(successful)}/{len(STOCKS)} stocks")
-    
-    # Calculate stats from raw parameters
-    avg_current_vol = np.sqrt(raw_params_df['v0']).mean() * 100
-    avg_longterm_vol = np.sqrt(raw_params_df['theta']).mean() * 100  
-    avg_correlation = raw_params_df['rho'].mean()
-    avg_mean_reversion = raw_params_df['kappa'].mean()
-    avg_error = raw_params_df['Calibration_Error_%'].mean()
-    
-    print(f"Average Current Vol: {avg_current_vol:.1f}%")
-    print(f"Average Long-term Vol: {avg_longterm_vol:.1f}%")
-    print(f"Average Correlation: {avg_correlation:.3f}")
-    print(f"Average Mean Reversion: {avg_mean_reversion:.2f}")
-    print(f"Average Calibration Error: {avg_error:.1f}%")
-    
-    # Regime classification
-    if avg_correlation < -0.5:
-        regime = "Strong Leverage Effect"
-    elif avg_correlation < -0.2:
-        regime = "Moderate Leverage Effect" 
-    else:
-        regime = "Weak Leverage Effect"
-    
-    print(f"Market Regime: {regime}")
-    
-    # Quality assessment
-    good_quality = len(raw_params_df[raw_params_df['Calibration_Error_%'] < 15])
-    print(f"High Quality Calibrations (<15% error): {good_quality}/30")
-    
-    print("\n🎉 Top 30 Stock Calibration completed successfully!")
+    stock_corr_df.to_csv('heston_correlation_matrix.csv')
+
+    print(f"RESULTS SAVED:")
+    print(f"• Heston Parameters: heston_parameters.csv")
+    print(f"• Stock Correlation Matrix: heston_correlation_matrix.csv")
+    print(f"• Total successful calibrations: {len(successful)}")
 
 if __name__ == "__main__":
     main()

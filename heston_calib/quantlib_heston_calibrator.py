@@ -5,7 +5,11 @@ from datetime import datetime, timedelta
 from typing import Optional, Tuple, Dict, Any
 from scipy.optimize import differential_evolution
 
-from market_data_fetcher import MarketDataFetcher
+# Handle both relative and absolute imports
+try:
+    from .market_data_fetcher import MarketDataFetcher
+except ImportError:
+    from market_data_fetcher import MarketDataFetcher
 
 
 class QuantLibHestonCalibrator:
@@ -90,6 +94,45 @@ class QuantLibHestonCalibrator:
         
         return helpers, grid_data
     
+    def _calculate_implied_vol(self, option_price: float, spot: float, strike: float, 
+                              time_to_expiry: float, option_type: str) -> Optional[float]:
+        """Calculate implied volatility from option price using QuantLib's implied volatility solver."""
+        try:
+            # Simple Black-Scholes implied volatility calculation
+            from scipy.optimize import brentq
+            
+            # Define Black-Scholes pricing function
+            def black_scholes_price(vol):
+                try:
+                    from math import log, exp, sqrt
+                    from scipy.stats import norm
+                    
+                    d1 = (log(spot / strike) + (self.r - self.q + 0.5 * vol**2) * time_to_expiry) / (vol * sqrt(time_to_expiry))
+                    d2 = d1 - vol * sqrt(time_to_expiry)
+                    
+                    if option_type.lower() == 'call':
+                        price = spot * exp(-self.q * time_to_expiry) * norm.cdf(d1) - strike * exp(-self.r * time_to_expiry) * norm.cdf(d2)
+                    else:
+                        price = strike * exp(-self.r * time_to_expiry) * norm.cdf(-d2) - spot * exp(-self.q * time_to_expiry) * norm.cdf(-d1)
+                    
+                    return price
+                except:
+                    return float('inf')
+            
+            # Objective function for root finding
+            def objective(vol):
+                return black_scholes_price(vol) - option_price
+            
+            # Use Brent's method to find the implied volatility
+            try:
+                implied_vol = brentq(objective, 0.001, 5.0, xtol=1e-6, maxiter=100)
+                return implied_vol if 0.01 < implied_vol < 5.0 else None
+            except:
+                return None
+                
+        except Exception as e:
+            return None
+
     def _cost_function_generator(self, model: ql.HestonModel, helpers: list, norm: bool = True):
         """Generate cost function for scipy optimization"""
         def cost_function(params):            
