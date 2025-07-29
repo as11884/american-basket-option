@@ -18,21 +18,17 @@ class RegressionBasis:
 
 
 class PolynomialBasis(RegressionBasis):
-    def __init__(self, degree=2):
+    def __init__(self, degree=4):
         self.degree = degree
-        self.poly = PolynomialFeatures(degree=self.degree, include_bias=True)
+        self.poly = PolynomialFeatures(degree=self.degree, include_bias=False)
         self.model = LinearRegression()
 
     def fit(self, X, y):
-        if X.ndim == 1:
-            X = X.reshape(-1, 1)
         X_poly = self.poly.fit_transform(X)
         self.model.fit(X_poly, y)
         return self
 
     def value(self, X):
-        if X.ndim == 1:
-            X = X.reshape(-1, 1)
         X_poly = self.poly.transform(X)
         return self.model.predict(X_poly)
 
@@ -85,66 +81,87 @@ def _rng(seed: Optional[int] = None) -> np.random.Generator:
 # ---------------------------
 
 class CorrelatedHeston:
-    def __init__(self,
-                 S0, r,
-                 v0, theta, kappa, sigma, rho_sv,
-                 corr_matrix,
-                 T, step, N,
-                 weights=None,
-                 var_corr_matrix=None):
+    def __init__(self, S0, r, v0, theta, kappa, sigma, rho_sv, corr_matrix, T, step, N, weights=None, var_corr_matrix=None):
         """
-        Multi-asset Heston under risk-neutral measure, Euler with full truncation.
+        Multi-asset Heston under risk-neutral measure using per-asset stock–variance coupling.
 
-        S0: (d,) initial prices
-        r: float risk-free (cont. comp.)
-        v0, theta, kappa, sigma, rho_sv: (d,)
-        corr_matrix: (d,d) stock-stock correlations
-        var_corr_matrix: (d,d) variance-variance correlations (default identity)
+        Construction (per time step):
+          1) Generate stock shocks W_S with Corr(W_S) = corr_matrix.
+          2) For each asset j, set W_V,j = rho_j * W_S,j + sqrt(1 - rho_j^2) * Z_V,j
+             where Z_V is i.i.d. standard normal and independent of W_S.
+        This guarantees Corr(W_S,j, W_V,j) = rho_j and Corr(W_S) = corr_matrix.
+        There is NO cross-asset mixing of W_V (i.e., no variance–variance correlation imposed).
+
+        Parameters:
+            S0 : (d,) initial stock prices
+            r  : risk-free rate (cont. comp.)
+            v0, theta, kappa, sigma, rho_sv : (d,) Heston parameters (rho_sv are per-asset S–v correlations)
+            corr_matrix : (d,d) stock–stock correlation matrix
+            T : total time
+            step : number of time steps
+            N : number of paths
+            weights : optional basket weights (defaults to equal)
+            var_corr_matrix : kept for API compatibility but UNUSED in this construction
         """
-        self.S0 = np.array(S0, dtype=float)
+        self.S0 = np.array(S0)
         self.r = float(r)
-        self.v0 = np.array(v0, dtype=float)
-        self.theta = np.array(theta, dtype=float)
-        self.kappa = np.array(kappa, dtype=float)
-        self.sigma = np.array(sigma, dtype=float)
-        self.rho_sv = np.array(rho_sv, dtype=float)
-        self.corr_matrix = np.array(corr_matrix, dtype=float)
-        self.var_corr_matrix = np.eye(len(S0)) if var_corr_matrix is None else np.array(var_corr_matrix, dtype=float)
+        self.v0 = np.array(v0)
+        self.theta = np.array(theta)
+        self.kappa = np.array(kappa)
+        self.sigma = np.array(sigma)
+        self.rho_sv = np.array(rho_sv)
+        self.corr_matrix = np.array(corr_matrix)
         self.T = float(T)
         self.step = int(step)
         self.N = int(N)
-        self.d = len(self.S0)
+        self.d = len(S0)
+        self.paths = None
+        self.variance_paths = None
+        self.basket_paths = None
 
+        # NOTE: var_corr_matrix is intentionally ignored in this implementation
+        self.var_corr_matrix = var_corr_matrix
+
+        # Initialize weights (equal-weight basket if not provided)
         if weights is None:
             self.weights = np.full(self.d, 1.0 / self.d)
         else:
-            self.weights = np.array(weights, dtype=float)
+            self.weights = np.array(weights)
 
-        self.paths: Optional[np.ndarray] = None
-        self.variance_paths: Optional[np.ndarray] = None
-        self.basket_paths: Optional[np.ndarray] = None
-
-    def generate_paths(self, seed: Optional[int] = None):
+    def generate_paths(self, seed: int | None = None):
+        """
+        Generate paths using Euler discretization with full truncation for variance.
+        """
+        rng = np.random.default_rng(seed)
         dt = self.T / self.step
         M = self.step + 1
         sqrt_dt = np.sqrt(dt)
-        rng = _rng(seed)
 
-        S_paths = np.zeros((self.N, M, self.d), dtype=float)
-        V_paths = np.zeros((self.N, M, self.d), dtype=float)
+        S_paths = np.zeros((self.N, M, self.d))
+        V_paths = np.zeros((self.N, M, self.d))
+
         S_paths[:, 0, :] = self.S0
         V_paths[:, 0, :] = self.v0
 
-        # Single block Cholesky for all shocks
-        L = _chol_block_correlation(self.corr_matrix, self.var_corr_matrix, self.rho_sv)
+        # Cholesky for stock correlations only
+        L_stock = np.linalg.cholesky(self.corr_matrix)
 
         for i in range(1, M):
-            Z = rng.standard_normal(size=(self.N, 2 * self.d))
-            W = Z @ L.T  # (N, 2d)
-            W_S = W[:, :self.d]
-            W_V = W[:, self.d:]
+            # Independent normals
+            Z_S = rng.standard_normal(size=(self.N, self.d))
+            Z_V = rng.standard_normal(size=(self.N, self.d))
 
-            # Euler (full truncation on drift and diffusion of v)
+            # Stock shocks with desired cross-asset correlation
+            W_S = Z_S @ L_stock.T  # shape (N, d)
+
+            # Per-asset variance shocks correlated with own stock shock
+            # W_V[:, j] = rho_j * W_S[:, j] + sqrt(1 - rho_j^2) * Z_V[:, j]
+            W_V = np.empty_like(W_S)
+            for j in range(self.d):
+                rho_j = self.rho_sv[j]
+                W_V[:, j] = rho_j * W_S[:, j] + np.sqrt(max(0.0, 1.0 - rho_j**2)) * Z_V[:, j]
+
+            # Euler updates (full truncation on v)
             for j in range(self.d):
                 V_prev = V_paths[:, i - 1, j]
                 V_pos = np.maximum(V_prev, 0.0)
@@ -159,33 +176,94 @@ class CorrelatedHeston:
 
         self.paths = S_paths
         self.variance_paths = V_paths
-        # reset cached basket
-        self.basket_paths = None
         return S_paths
 
-    def get_basket_paths(self,
-                         kind: Literal["geometric", "arithmetic"] = "geometric"):
+    def get_basket_paths(self, kind: Literal["geometric", "arithmetic"] = "geometric"):
+        """
+        Basket paths with configurable averaging method.
+        
+        Parameters:
+            kind: "geometric" or "arithmetic" averaging method
+        """
         if self.paths is None:
             raise ValueError("No paths generated. Call generate_paths() first.")
 
         if self.basket_paths is None or getattr(self, "_basket_kind", None) != kind:
             w = self.weights / np.sum(self.weights)
             if kind == "geometric":
-                # weighted geometric mean = exp(sum_i w_i log S_i)
-                logS = np.log(self.paths)
-                weighted_mean_log = np.tensordot(logS, w, axes=([2], [0]))
+                # Weighted geometric mean: exp(sum_i w_i log S_i)
+                log_prices = np.log(self.paths)            # (N, M, d)
+                weighted_mean_log = np.tensordot(log_prices, w, axes=([2], [0]))  # (N, M)
                 self.basket_paths = np.exp(weighted_mean_log)
             elif kind == "arithmetic":
+                # Weighted arithmetic mean: sum_i w_i S_i
                 self.basket_paths = np.tensordot(self.paths, w, axes=([2], [0]))
             else:
-                raise ValueError("Unknown basket kind.")
+                raise ValueError("Unknown basket kind. Use 'geometric' or 'arithmetic'.")
             self._basket_kind = kind
+
         return self.basket_paths
 
     def get_variance_paths(self):
         if self.variance_paths is None:
             raise ValueError("No paths generated. Call generate_paths() first.")
         return self.variance_paths
+
+    def plot_paths(self, basket_only=False, plot_variance=False):
+        if self.paths is None:
+            raise ValueError("No paths generated. Call generate_paths() first.")
+
+        N, M, d = self.paths.shape
+        time = np.linspace(0, self.T, M)
+
+        if basket_only:
+            plt.figure(figsize=(12, 8))
+            if plot_variance:
+                plt.subplot(2, 1, 1)
+
+            basket_paths = self.get_basket_paths()
+            for j in range(min(N, 50)):
+                plt.plot(time, basket_paths[j, :], alpha=0.5)
+            plt.title('Geometric Average Basket Paths (Heston)')
+            plt.xlabel('Time (years)')
+            plt.ylabel('Basket Price')
+            plt.grid()
+
+            if plot_variance:
+                plt.subplot(2, 1, 2)
+                avg_variance = np.mean(self.variance_paths, axis=2)
+                for j in range(min(N, 50)):
+                    plt.plot(time, avg_variance[j, :], alpha=0.5)
+                plt.title('Average Variance Paths')
+                plt.xlabel('Time (years)')
+                plt.ylabel('Variance')
+                plt.grid()
+
+            plt.tight_layout()
+            plt.show()
+        else:
+            for i in range(d):
+                plt.figure(figsize=(12, 8))
+                if plot_variance:
+                    plt.subplot(2, 1, 1)
+                for j in range(min(N, 20)):
+                    plt.plot(time, self.paths[j, :, i], alpha=0.5)
+                plt.title(f'Heston Price Paths for Asset {i + 1}')
+                plt.xlabel('Time (years)')
+                plt.ylabel('Price')
+                plt.grid()
+
+                if plot_variance:
+                    plt.subplot(2, 1, 2)
+                    for j in range(min(N, 20)):
+                        plt.plot(time, self.variance_paths[j, :, i], alpha=0.5)
+                    plt.title(f'Variance Paths for Asset {i + 1}')
+                    plt.xlabel('Time (years)')
+                    plt.ylabel('Variance')
+                    plt.grid()
+
+                plt.tight_layout()
+                plt.show()
 
 
 class CorrelatedGBM:
@@ -262,10 +340,11 @@ class LSMOptionPricer:
                  r: float,
                  K: float,
                  weights: np.ndarray = None,
-                 option: Literal["call", "put"] = "call",
+                 option: Literal["call", "put"] = "put",
                  model: Literal["gbm", "heston"] = "gbm",
                  basket_kind: Literal["geometric", "arithmetic"] = "geometric",
                  include_variance_state: bool = False,
+                 degree: int = 4,  # Polynomial degree for LSM regression
                  # GBM
                  cov: np.ndarray = None,
                  # Heston
@@ -288,6 +367,7 @@ class LSMOptionPricer:
         self.model = model
         self.basket_kind = basket_kind
         self.include_variance_state = include_variance_state
+        self.degree = int(degree)  # Store polynomial degree as instance variable
 
         # Model params
         self.cov = cov
@@ -370,7 +450,6 @@ class LSMOptionPricer:
             return self.basket_paths[itm_mask, t]        # (n_itm,)
 
     def _lsm_core(self,
-                  basis: RegressionBasis,
                   exercise_grid: Optional[Tuple[int, ...]],
                   use_individual_prices: bool):
         """
@@ -403,7 +482,7 @@ class LSMOptionPricer:
             Y = cashflow[itm] * (self.disc ** discount_steps)
 
             # Fit a fresh basis at time t
-            time_basis = PolynomialBasis(degree=basis.degree) if isinstance(basis, PolynomialBasis) else basis
+            time_basis = PolynomialBasis(degree=self.degree)
             time_basis.fit(X, Y)
             trained_models[t] = time_basis
 
@@ -437,20 +516,17 @@ class LSMOptionPricer:
         """
         One-shot LSM price (no model persistence).
         """
-        if basis is None:
-            basis = PolynomialBasis(degree=2)
         if include_variance_state is not None:
             self.include_variance_state = include_variance_state
 
         self.simulate_paths(seed=seed)
-        price, std, se, ex_times, _, _, _ = self._lsm_core(basis, exercise_grid, use_individual_prices)
+        price, std, se, ex_times, _, _, _ = self._lsm_core(exercise_grid, use_individual_prices)
 
         if return_exercise_times:
             return price, std, se, ex_times
         return price, std, se
 
     def train(self,
-              basis: Optional[RegressionBasis] = None,
               exercise_grid: Optional[Tuple[int, ...]] = None,
               use_individual_prices: bool = True,
               include_variance_state: Optional[bool] = None,
@@ -459,20 +535,18 @@ class LSMOptionPricer:
         """
         Fit continuation regressions and store them (in-sample).
         """
-        if basis is None:
-            basis = PolynomialBasis(degree=2)
         if include_variance_state is not None:
             self.include_variance_state = include_variance_state
 
         self.simulate_paths(seed=seed)
-        price, std, se, ex_times, models, ex_grid, uip = self._lsm_core(basis, exercise_grid, use_individual_prices)
+        price, std, se, ex_times, models, ex_grid, uip = self._lsm_core(exercise_grid, use_individual_prices)
 
         # Persist models/flags for testing
         self.trained_models = models
         self.exercise_grid = ex_grid
         self.use_individual_prices = uip
         self._trained_flags = {
-            "basis_degree": getattr(basis, "degree", None),
+            "basis_degree": self.degree,
             "include_variance_state": self.include_variance_state,
             "basket_kind": self.basket_kind,
             "option": self.option,
@@ -493,24 +567,30 @@ class LSMOptionPricer:
         if n_test_paths is not None:
             self.N = int(n_test_paths)
 
-        # New paths
+        # Generate NEW paths and calculate NEW payoffs for testing
         self.simulate_paths(seed=seed)
+        
+        # Calculate payoff on the NEW test paths
+        if self.option == "call":
+            test_payoff = np.maximum(self.basket_paths - self.K, 0.0)
+        else:
+            test_payoff = np.maximum(self.K - self.basket_paths, 0.0)
 
         Npaths, M = self.basket_paths.shape
-        cashflow = self.payoff[:, -1].copy()
+        cashflow = test_payoff[:, -1].copy()  # Use NEW payoff at maturity
         exercise_time = np.full(Npaths, M - 1, dtype=int)
 
-        # Apply trained models
+        # Apply trained models to NEW test data
         for t in reversed(self.exercise_grid):
-            itm = self.payoff[:, t] > 0.0
+            itm = test_payoff[:, t] > 0.0  # Use NEW payoff for ITM check
             if not np.any(itm):
                 continue
             if t not in self.trained_models:
                 continue
 
             X_test = self._state_at(t, itm, self.use_individual_prices)
-            cont_val = self.trained_models[t].value(X_test)
-            immediate = self.payoff[itm, t]
+            cont_val = self.trained_models[t].value(X_test)  # Apply TRAINED model
+            immediate = test_payoff[itm, t]  # Use NEW payoff for immediate exercise
             exercise = immediate >= cont_val
 
             itm_idx = np.where(itm)[0]
@@ -538,17 +618,17 @@ if __name__ == "__main__":
     # Parameters
     n_assets = 5
     S0 = np.full(n_assets, 100.0)
-    r = 0.05
-    T = 0.25
-    step = 50
-    N_train = 100000
-    N_test = 100000
-    K = 120.0
+    r = 0.04
+    T = 0.5
+    step = 252/2
+    N_train = 300000
+    N_test = 300000
+    K = 100.0
     weights = np.full(n_assets, 1.0 / n_assets)
 
     # GBM covariance with uniform corr
-    sig = 0.20
-    corr = 0.30
+    sig = 0.40
+    corr = 0.50
     cov = np.full((n_assets, n_assets), corr * sig * sig)
     np.fill_diagonal(cov, sig * sig)
 
@@ -563,13 +643,13 @@ if __name__ == "__main__":
         model="gbm",
         basket_kind="arithmetic",
         include_variance_state=False,   # (ignored for GBM)
+        degree=2,  # Use degree 2 polynomial for this demo
         cov=cov
     )
 
     # Train (use a fixed seed for reproducibility)
     train_seed = 12345
     training_price, training_std, training_se = pricer.train(
-        basis=PolynomialBasis(degree=2),
         use_individual_prices=True,
         seed=train_seed
     )
@@ -585,7 +665,7 @@ if __name__ == "__main__":
         tp, tstd, tse = pricer.test(n_test_paths=N_test, seed=sd)
         test_prices.append(tp)
         diff = tp - training_price
-        flag = abs(diff) > 2.0 * tse
+        flag = abs(diff) > 2.0 * np.sqrt(training_se**2 + tse**2)
         exceed_2se += int(flag)
         mark = " **" if flag else ""
         print(f"  Batch {i}: {tp:.4f}  ± {tse:.4f} (SE),  Δ={diff:+.4f}{mark}")
