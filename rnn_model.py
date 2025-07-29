@@ -5,33 +5,54 @@ import numpy as np
 import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader, TensorDataset
 from torch.optim.lr_scheduler import ReduceLROnPlateau
+from longstaff_schwartz import CorrelatedGBM
 
-# 1. data generator
-def generate_american_option_data(M=5000, N=100, d=5, S0=100, K=100, r=0.05, sigma=0.2):
-    print("Generating data...")
-    dt = 1.0 / N
-    S = torch.zeros(M, N+1, d)
-    S[:,0] = S0
+# 1. data generator using existing CorrelatedGBM
+def generate_american_option_data(M=5000, N=126, d=5, S0=100.0, K=100.0, r=0.04, T=0.5, sig=0.40, corr=0.50):
+    print("Generating data using CorrelatedGBM...")
     
-    for t in range(1, N+1):
-        dW = torch.randn(M, d) * np.sqrt(dt)
-        S[:,t] = S[:,t-1] * torch.exp((r-0.5*sigma**2)*dt + sigma*dW)
+    # Create same covariance matrix as Longstaff-Schwartz
+    S0_array = np.full(d, S0)
+    cov = np.full((d, d), corr * sig * sig)
+    np.fill_diagonal(cov, sig * sig)
+    
+    # Use existing CorrelatedGBM class
+    gbm_model = CorrelatedGBM(
+        S0=S0_array, 
+        r=r, 
+        cov=cov, 
+        T=T, 
+        step=N, 
+        N=M
+    )
+    
+    # Generate paths: shape (M, N+1, d) 
+    paths = gbm_model.generate_paths(seed=42)
+    
+    # Convert to torch tensors
+    S = torch.from_numpy(paths).float()
     
     # data standardization
     S_mean = S.mean(dim=(0,1), keepdim=True)
     S_std = S.std(dim=(0,1), keepdim=True) + 1e-8
-    S = (S - S_mean) / S_std
+    S_normalized = (S - S_mean) / S_std
     
-    adjusted_K = (K - S_mean) / S_std
-    g = torch.max(S[:,1:] - adjusted_K, dim=-1).values
-    payoff_T = torch.max(S[:,-1] - adjusted_K.squeeze(1), dim=-1).values
-    delta_T = (S[:,1:] > adjusted_K).float()
+    # Arithmetic basket (same as Longstaff-Schwartz)
+    weights = torch.full((d,), 1.0/d)  # Equal weights
+    basket_prices = (S * weights).sum(dim=-1)  # Arithmetic average
     
-    times = torch.linspace(0, 1, N+1).unsqueeze(0).repeat(M,1)
-    discount = torch.exp(-r * (1 - times[:,1:]))
+    # American put payoff: max(K - basket_price, 0)
+    payoffs = torch.maximum(torch.tensor(K) - basket_prices[:,1:], torch.tensor(0.0))
+    payoff_T = torch.maximum(torch.tensor(K) - basket_prices[:,-1], torch.tensor(0.0))
+    
+    # Exercise indicators (1 if should exercise, 0 otherwise)
+    delta_T = (basket_prices[:,1:] < K).float()
+    
+    times = torch.linspace(0, T, N+1).unsqueeze(0).repeat(M,1)
+    discount = torch.exp(-r * (T - times[:,1:]))
     
     print("Data generation complete!")
-    return S[:,1:], g.unsqueeze(-1), discount, payoff_T, delta_T, S_mean, S_std
+    return S_normalized[:,1:], payoffs.unsqueeze(-1), discount, payoff_T, delta_T, S_mean, S_std
 
 # 2. network structure
 class PriceGRUNet(nn.Module):
@@ -141,13 +162,27 @@ def bsde_loss(y_pred, y_true, delta_pred, S, rho, sigma, dt, r):
 # 4. Training function
 def train_model():
     print("Initializing model...")
+    # Use same parameters as Longstaff-Schwartz
     d = 5
+    S0 = 100.0
+    K = 100.0
+    r = 0.04
+    T = 0.5
+    N = int(252/2)  # 126 time steps
+    sig = 0.40
+    corr = 0.50
+    
     model = AmericanOptionRNN(d=d)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
     scheduler = ReduceLROnPlateau(optimizer, 'min', patience=5, factor=0.5)
     
     print("Loading data...")
-    S, g_S, discount, payoff_T, delta_T, S_mean, S_std = generate_american_option_data(d=d)
+    print(f"Parameters: S0={S0}, K={K}, T={T}, r={r}, sig={sig}, corr={corr}")
+    print(f"Assets: {d}, Time steps: {N}")
+    
+    S, g_S, discount, payoff_T, delta_T, S_mean, S_std = generate_american_option_data(
+        M=5000, N=N, d=d, S0=S0, K=K, r=r, T=T, sig=sig, corr=corr
+    )
     dataset = TensorDataset(S, g_S, discount, payoff_T, delta_T)
     loader = DataLoader(dataset, batch_size=512, shuffle=True)
     
@@ -161,8 +196,8 @@ def train_model():
             
             y_true = (payoff_batch.unsqueeze(1) * disc_batch).unsqueeze(-1)
             
-            rho = torch.eye(d) * 0.9 + 0.1
-            loss = bsde_loss(y_pred, y_true, delta_pred, S_batch, rho, sigma=0.2, dt=1/100, r=0.05)
+            rho = torch.eye(d) * (1-corr) + corr  # Use same correlation structure
+            loss = bsde_loss(y_pred, y_true, delta_pred, S_batch, rho, sigma=sig, dt=T/N, r=r)
             
             optimizer.zero_grad()
             loss.backward()
@@ -243,13 +278,48 @@ def visualize_predictions(model, loader, num_examples=3, S_mean=None, S_std=None
 
 
 if __name__ == "__main__":
+    # Use exact same parameters as Longstaff-Schwartz
+    print("RNN American PUT Option Pricing (matching Longstaff-Schwartz parameters)")
+    print("=" * 72)
+    
+    # Parameters (matching longstaff_schwartz.py main)
+    n_assets = 5
+    S0 = 100.0
+    K = 100.0
+    r = 0.04
+    T = 0.5
+    N = int(252/2)  # 126 time steps
+    sig = 0.40      # volatility
+    corr = 0.50     # correlation
+    
+    print(f"S0={S0}, K={K}, T={T}, r={r}, sig={sig}, corr={corr}")
+    print(f"Assets: {n_assets}, Time steps: {N}")
+    print("=" * 72)
+    
+    # Train the model
     trained_model = train_model()
+    
+    # Test model functionality
     test_model(trained_model)
-    S, g_S, discount, payoff_T, delta_T, S_mean, S_std = generate_american_option_data(d=5)
+    
+    # Generate data for visualization with same parameters
+    S, g_S, discount, payoff_T, delta_T, S_mean, S_std = generate_american_option_data(
+        M=1000, N=N, d=n_assets, S0=S0, K=K, r=r, T=T, sig=sig, corr=corr
+    )
     dataset = TensorDataset(S, g_S, discount, payoff_T, delta_T)
     loader = DataLoader(dataset, batch_size=100)
 
+    # Visualize predictions
     visualize_predictions(trained_model, loader, num_examples=3, S_mean=S_mean, S_std=S_std)
 
+    # Save the trained model
     torch.save(trained_model.state_dict(), "american_option_rnn.pth")
     print("Model saved to 'american_option_rnn.pth'")
+    
+    print("\n" + "=" * 72)
+    print("RNN Training Complete - Model uses same parameters as Longstaff-Schwartz:")
+    print(f"• {n_assets} assets, arithmetic basket American PUT")
+    print(f"• S0={S0}, K={K}, T={T} years, r={r*100}%")
+    print(f"• Volatility: {sig*100}%, Correlation: {corr*100}%")
+    print(f"• Time steps: {N}")
+    print("=" * 72)
