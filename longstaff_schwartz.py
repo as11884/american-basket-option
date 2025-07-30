@@ -618,21 +618,21 @@ if __name__ == "__main__":
     # Parameters
     n_assets = 5
     S0 = np.full(n_assets, 100.0)
-    r = 0.04
+    r = 0.1
     T = 0.5
-    step = 252/2
-    N_train = 300000
-    N_test = 300000
+    step = 126
+    N_train = 100000
+    N_test = 100000
     K = 100.0
     weights = np.full(n_assets, 1.0 / n_assets)
 
     # GBM covariance with uniform corr
-    sig = 0.40
-    corr = 0.50
+    sig = 0.2
+    corr = 0.30
     cov = np.full((n_assets, n_assets), corr * sig * sig)
     np.fill_diagonal(cov, sig * sig)
 
-    print("Out-of-Sample LSM Testing for American PUT (arithmetic basket)")
+    print("Out-of-Sample LSM Testing for American PUT (geometric basket)")
     print(f"S0={S0[0]}, K={K}, T={T}, r={r}, Training paths: {N_train}, Test paths per batch: {N_test}")
     print("=" * 72)
 
@@ -641,7 +641,7 @@ if __name__ == "__main__":
         weights=weights,
         option="put",
         model="gbm",
-        basket_kind="arithmetic",
+        basket_kind="geometric",
         include_variance_state=False,   # (ignored for GBM)
         degree=2,  # Use degree 2 polynomial for this demo
         cov=cov
@@ -654,6 +654,12 @@ if __name__ == "__main__":
         seed=train_seed
     )
     print(f"Training:  {training_price:.4f}  ± {training_se:.4f}  (SE),  STD={training_std:.4f}")
+    
+    # European option price for comparison (same paths)
+    euro_payoff = pricer.payoff[:, -1]  # Payoff at maturity
+    euro_prices = euro_payoff * np.exp(-r * T)  # Discount to t=0
+    euro_price = float(np.mean(euro_prices))
+    print(f"European:  {euro_price:.4f}")
 
     # Out-of-sample batches with distinct seeds
     seeds = [101, 202, 303, 404, 505]
