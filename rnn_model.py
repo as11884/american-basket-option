@@ -150,7 +150,7 @@ class RNNAmericanTrainer:
         z_weight: float = 1.0,                 # EXACT paper loss when z_weight=1.0
         smooth_labels: bool = True, smooth_only_at_maturity: bool = False,
         lookahead_window: int = None,
-        shuffle: bool = True, drop_last: bool = True,
+        shuffle: bool = False, drop_last: bool = True,
         resimulate_every: int = 1,             # 1 = resim each epoch; >1 keeps paths fixed for K-1 epochs
     ):
         assert kind in ("call", "put")
@@ -417,6 +417,7 @@ class RNNAmericanTrainer:
         """
         If use_cached_paths=True and cached paths exist, reuse last epoch's paths.
         Set inference_batch_size=None to disable batching (single pass on all paths).
+        Returns: (y0_mean, V0, delta0_mean) - continuation value, American value, and delta at t0
         """
         # select source
         if use_cached_paths and (self.cached_paths_cpu is not None):
@@ -438,33 +439,51 @@ class RNNAmericanTrainer:
             X_rev = X.flip(dims=[1])
 
             S_T   = batch_paths[:, N, :]
-            fT_k, _ = smooth_payoff_and_grad(S_T, self.K, self.w, self.kind, kappa_eff)
+            fT_k, gradT_k = smooth_payoff_and_grad(S_T, self.K, self.w, self.kind, kappa_eff)
             h0_price = fT_k.view(1, b, 1).repeat(self.price_net.gru.num_layers, 1, self.price_net.gru.hidden_size)
+            
+            # Delta network initialization (same as in training)
+            h0_delta_base = self.delta_h0_proj(gradT_k)     # (b,H)
+            h0_delta = h0_delta_base.unsqueeze(0).repeat(self.delta_net.gru.num_layers, 1, 1)
 
             y_raw  = self.price_net(X_rev, h0=h0_price)    # (b,N,1)
+            d_all  = self.delta_net(X_rev, h0=h0_delta)    # (b,N,d)
             y_all  = y_raw  # no price blend for inference (alpha_price=1.0)
+            
+            # Apply delta blending (same as in training)
+            n_idx = torch.arange(N, device=self.dev, dtype=batch_paths.dtype)
+            Dn    = torch.exp(-self.r * (self.T - n_idx * self.dt))
+            S_all_clamped = S_all.clamp_min(5e-4)
+            base_delta = Dn.view(1,N,1) * (gradT_k.view(b,1,d) * (batch_paths[:, N, :].view(b,1,d) / S_all_clamped))
+            d_all = self.beta * d_all + (1.0 - self.beta) * base_delta
 
-            return y_all[:, 0, 0]  # (b,)
+            return y_all[:, 0, 0], d_all[:, 0, :]  # (b,), (b,d)
 
         if inference_batch_size is None:
-            y0_paths = _eval_batch(S_paths_cpu.to(self.dev, non_blocking=True))
+            y0_paths, delta0_paths = _eval_batch(S_paths_cpu.to(self.dev, non_blocking=True))
         else:
             y0_all = []
+            delta0_all = []
             num_batches = (M + inference_batch_size - 1) // inference_batch_size
             for bidx in range(num_batches):
                 s = bidx * inference_batch_size
                 e = min((bidx + 1) * inference_batch_size, M)
                 batch_paths = S_paths_cpu[s:e].to(self.dev, non_blocking=True)
-                y0_all.append(_eval_batch(batch_paths))
+                y0_batch, delta0_batch = _eval_batch(batch_paths)
+                y0_all.append(y0_batch)
+                delta0_all.append(delta0_batch)
             y0_paths = torch.cat(y0_all, dim=0)
+            delta0_paths = torch.cat(delta0_all, dim=0)
 
         y0_mean = y0_paths.mean()
+        delta0_mean = delta0_paths.mean(dim=0)  # (d,) - average delta across paths
 
         # American value at t0 = max(f(S0), y0_mean)
         S0_batch = torch.from_numpy(self.S0).float().unsqueeze(0).to(self.dev)  # (1, d)
         f0       = payoff_arith(S0_batch, self.K, self.w, self.kind)[0]
         V0       = torch.maximum(f0, y0_mean)
-        return y0_mean.item(), V0.item()
+        
+        return y0_mean.item(), V0.item(), delta0_mean.cpu().numpy()
 
     # ----- Save -----
     def save(self, path: str = "american_arith_two_rnn_bsde.pth"):
@@ -492,16 +511,21 @@ class RNNAmericanTrainer:
 # ---------------------------
 if __name__ == "__main__":
     d = 5
+    # Lower correlation to see more independent behavior
     corr_matrix = np.eye(d)
-    corr_matrix.fill(0.30)
+    corr_matrix.fill(0.15)  # Reduced from 0.30 to 0.15
     np.fill_diagonal(corr_matrix, 1.0)
 
-    S0_vector = np.full(d, 100.0)  
+    # Different initial prices to break symmetry
+    S0_vector = np.array([90.0, 95.0, 100.0, 105.0, 110.0])  # Range from 90 to 110
+    
+    # Different weights (must sum to 1)
+    weights = np.array([0.3, 0.25, 0.2, 0.15, 0.1])  # Decreasing weights
     
     trainer = RNNAmericanTrainer(
         d=d, S0=S0_vector, K=100.0, r=0.1, T=0.5, N=126,   # match your LSM discretization
-        sig=0.2, corr=corr_matrix, kind="put",
-        M=50000, batch_size=4096, epochs=20, seed=12345,  # Increased for CPU
+        sig=0.2, corr=corr_matrix, kind="put", weights=weights,
+        M=50000, batch_size=4096, epochs=10, seed=12345,  # Increased for CPU
         hidden_dim=64, num_layers=3,
         lr=1e-3, grad_clip=1.0,
         
@@ -517,9 +541,20 @@ if __name__ == "__main__":
 
     trainer.train()
 
+    # Print setup info
+    print(f"\n--- Setup ---")
+    print(f"Initial prices: {S0_vector}")
+    print(f"Weights: {weights}")
+    print(f"Strike: {trainer.K}")
+    print(f"Correlation: {corr_matrix[0,1]:.2f} (off-diagonal)")
+
     # Inference on cached training paths (single pass for exact average)
-    y0_cached, V0_cached = trainer.price_at_t0(inference_batch_size=4096, use_cached_paths=True)
+    y0_cached, V0_cached, delta0_cached = trainer.price_at_t0(inference_batch_size=4096, use_cached_paths=True)
+    print(f"\n--- Results ---")
     print("Cached paths -> t0 continuation:", round(y0_cached, 6))
     print("Cached paths -> t0 American   :", round(V0_cached, 6))
+    print("Cached paths -> t0 deltas     :")
+    for i, (s0, w, delta) in enumerate(zip(S0_vector, weights, delta0_cached)):
+        print(f"  Asset {i+1}: S0={s0:6.1f}, weight={w:5.2f}, delta={delta:8.6f}")
 
     trainer.save()
