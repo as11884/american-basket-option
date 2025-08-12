@@ -609,31 +609,95 @@ class LSMOptionPricer:
         self.N = original_N
         return test_price, test_std, test_se
 
+    def delta(self, 
+              bump_size: float = 0.01,
+              use_relative_bump: bool = True,
+              seed: Optional[int] = None,
+              **kwargs):
+        """
+        Calculate delta (price sensitivity) for each underlying asset using finite differences.
+        
+        Parameters:
+        -----------
+        bump_size : float, default=0.01
+            Size of the price bump (1% if relative, absolute amount if not)
+        use_relative_bump : bool, default=True
+            If True, bump is relative to S0 (e.g., 1% = 0.01)
+            If False, bump is absolute price change
+        seed : int, optional
+            Random seed for path generation
+        **kwargs : dict
+            Additional arguments passed to price() method
+            
+        Returns:
+        --------
+        deltas : np.ndarray
+            Array of deltas, one for each underlying asset
+        base_price : float
+            The base option price (no bumps)
+        """
+        # Store original S0
+        original_S0 = self.S0.copy()
+        
+        # Calculate base price
+        base_price, _, _ = self.price(seed=seed, **kwargs)
+        
+        # Initialize delta array
+        n_assets = len(self.S0)
+        deltas = np.zeros(n_assets)
+        
+        # Calculate delta for each asset by bumping one at a time
+        for i in range(n_assets):
+            # Restore original prices
+            self.S0 = original_S0.copy()
+            
+            # Bump the i-th asset
+            if use_relative_bump:
+                bump_amount = self.S0[i] * bump_size
+            else:
+                bump_amount = bump_size
+            
+            self.S0[i] += bump_amount
+            
+            # Calculate bumped price with same seed for consistency
+            bumped_price, _, _ = self.price(seed=seed, **kwargs)
+            
+            # Calculate finite difference delta
+            deltas[i] = (bumped_price - base_price) / bump_amount
+        
+        # Restore original S0
+        self.S0 = original_S0.copy()
+        
+        return deltas, base_price
+
 
 # ---------------------------
 # Demo / diagnostic
 # ---------------------------
 
 if __name__ == "__main__":
-    # Parameters
+    # Parameters with ASYMMETRIC setup to show varied deltas
     n_assets = 5
-    S0 = np.full(n_assets, 100.0)
+    S0 = np.array([90.0, 95.0, 100.0, 105.0, 110.0])  # Different initial prices
     r = 0.1
     T = 0.5
     step = 126
-    N_train = 100000
-    N_test = 100000
+    N_train = 50000  # Reduced for faster demo
+    N_test = 10000
     K = 100.0
-    weights = np.full(n_assets, 1.0 / n_assets)
+    weights = np.array([0.3, 0.25, 0.2, 0.15, 0.1])  # Different weights
 
-    # GBM covariance with uniform corr
+    # Lower correlation to reduce co-movement
     sig = 0.2
-    corr = 0.30
+    corr = 0.15  # Reduced from 0.30 to 0.15
     cov = np.full((n_assets, n_assets), corr * sig * sig)
     np.fill_diagonal(cov, sig * sig)
 
     print("Out-of-Sample LSM Testing for American PUT (geometric basket)")
-    print(f"S0={S0[0]}, K={K}, T={T}, r={r}, Training paths: {N_train}, Test paths per batch: {N_test}")
+    print(f"Initial prices: {S0}")
+    print(f"Weights: {weights}")
+    print(f"Strike: K={K}, T={T}, r={r}, Correlation: {corr}")
+    print(f"Training paths: {N_train}, Test paths per batch: {N_test}")
     print("=" * 72)
 
     pricer = LSMOptionPricer(
@@ -681,3 +745,23 @@ if __name__ == "__main__":
     print("-" * 72)
     print(f"Mean OOS: {mean_test:.4f}, Bias (mean_oos - train): {bias:+.4f}")
     print(f"Share of batches where |Δ| > 2 × SE_test: {exceed_2se}/{len(seeds)}")
+    
+    # Calculate deltas using finite differences
+    print("\n" + "=" * 72)
+    print("DELTA CALCULATION (Finite Differences)")
+    print("=" * 72)
+    
+    # Use the trained model for delta calculation (same seed for consistency)
+    deltas, base_price = pricer.delta(
+        bump_size=0.01,  # 1% relative bump
+        use_relative_bump=True,
+        seed=train_seed  # Use same seed as training for consistency
+    )
+    
+    print(f"Base price: {base_price:.6f}")
+    print(f"Deltas (1% bump):")
+    for i, (s0, w, delta) in enumerate(zip(S0, weights, deltas)):
+        print(f"  Asset {i+1}: S0={s0:6.1f}, weight={w:5.3f}, delta={delta:8.6f}")
+    
+    print(f"\nSum of weighted deltas: {np.sum(deltas * weights):.6f}")
+    print(f"Portfolio delta (basket): {np.sum(deltas * weights):.6f}")
