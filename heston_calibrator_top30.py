@@ -94,13 +94,13 @@ def calibrate_stock(ticker):
                 'time_taken': time.time() - start_time,
                 'raw_params': params  # Include raw Heston parameters
             }
-            print(f"✅ {ticker} completed - Error: {info['average_error']:.1f}% ({time.time()-start_time:.1f}s)")
+            print(f"{ticker} completed - Error: {info['average_error']:.1f}% ({time.time()-start_time:.1f}s)")
             return result
         else:
             return {'ticker': ticker, 'success': False, 'error': 'Calibration failed'}
             
     except Exception as e:
-        print(f"❌ {ticker} failed: {str(e)}")
+        print(f"{ticker} failed: {str(e)}")
         return {'ticker': ticker, 'success': False, 'error': str(e)}
 
 def main():
@@ -118,7 +118,7 @@ def main():
     start_time = time.time()
     results = []
     
-    print("🔄 Starting parallel calibrations...")
+    print("Starting parallel calibrations...")
     with ThreadPoolExecutor(max_workers=PARALLEL_WORKERS) as executor:
         # Submit all tasks
         futures = {executor.submit(calibrate_stock, ticker): ticker for ticker in STOCKS}
@@ -175,7 +175,7 @@ def main():
     raw_params_df = pd.DataFrame(raw_params)
     
     # 2. Calculate ACTUAL stock correlation matrix using historical returns
-    print("📊 Calculating stock correlation matrix from historical returns...")
+    print("Calculating stock correlation matrix from historical returns...")
     successful_tickers = [r['ticker'] for r in successful]
     
     try:

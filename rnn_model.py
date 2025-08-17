@@ -5,7 +5,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 import torch.nn.functional as F
 
-# Your GBM path generator (must be importable):
+# ---- GBM path generator ----
 from longstaff_schwartz import CorrelatedGBM
 
 
