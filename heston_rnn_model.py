@@ -1,3 +1,4 @@
+# heston_rnn_model_fixed.py
 import math
 import numpy as np
 import torch
@@ -147,8 +148,8 @@ class AlphaGRU(nn.Module):
 def _ridge_ols_alpha(F: torch.Tensor, X: torch.Tensor, ridge: float = 1e-6) -> torch.Tensor:
     """
     F: (B,)   discounted continuation increment / sqrt(dt)
-    X: (B,d)  regressors = stock shocks / sqrt(dt)
-    returns α_c: (d,)  batch-shared slope
+    X: (B,d)  regressors = standardized log-return shocks (≈ L ε)
+    returns α_c: (d,)  batch-shared slope in stock-shock (X) space
     """
     B, d = X.shape
     Xt = X.transpose(0, 1)                 # (d,B)
@@ -176,7 +177,7 @@ class RNNAmericanHestonAlphaTrainer:
         kappa: float = 10.0, delta_activation: str = "tanh",
         beta: float = 0.5,                     # delta β-blend
         alpha_price: float = 1.0,              # price blend (0..1), keep 1.0
-        z_weight: float = 1.0,                 # scale on Z-loss
+        z_weight: float = 1.0,                 # scale on Z-loss (paper scaling is applied)
         delta_aux_weight: float = 0.0,         # optional Δ auxiliary MSE weight
         smooth_labels: bool = True, smooth_only_at_maturity: bool = False,
         lookahead_window: int = None,
@@ -258,6 +259,17 @@ class RNNAmericanHestonAlphaTrainer:
         for t in tensors:
             if not torch.isfinite(t).all():
                 raise RuntimeError(f"{name}: found NaN/Inf in {name} tensor of shape {t.shape}")
+
+    def _alpha_to_shares(self, alpha_vec: torch.Tensor, S_vec: torch.Tensor, v_vec: torch.Tensor) -> torch.Tensor:
+        """
+        alpha_vec: (d,)   — coefficient in stock-shock (X=Lε) space
+        S_vec:     (d,)   — spot
+        v_vec:     (d,)   — inst. variance
+        Hedge shares (continuation region): h = alpha / (S * sqrt(v))   elementwise.
+        """
+        eps = 1e-12
+        denom = (S_vec * torch.sqrt(v_vec.clamp_min(eps))).clamp_min(1e-12)
+        return alpha_vec / denom
 
     # ----- Simulation (Heston) -----
     def _simulate_paths(self, epoch_seed: int):
@@ -386,53 +398,52 @@ class RNNAmericanHestonAlphaTrainer:
                 # Accumulate loss across time
                 loss_sum = val_sum = del_sum = 0.0
                 for n in range(N):
-                    # labels at n and n+1
-                    c_n,  dC_n  = self._build_lookahead_labels(S_batch, n,   kappa_eff)        # (B,1),(B,d)
-                    if n+1 < N:
-                        c_np1, _ = self._build_lookahead_labels(S_batch, n+1, kappa_eff)       # (B,1)
-                    else:
-                        c_np1 = c_n.clone()
+                    # value labels at n
+                    c_n,  dC_n  = self._build_lookahead_labels(S_batch, n,   kappa_eff)  # (B,1),(B,d)
 
                     # value MSE
                     y_n = y_all[:, n, :].contiguous()
                     val_term = (c_n - y_n).pow(2).mean()
 
-                    # α-label by OLS on stock shocks X_n
-                    t_n   = n * self.dt
+                    # ----- Z(stock) loss via α-label from model's own Y (stop-grad) -----
+                    y_det = y_all.detach()  # (B,N,1) stop gradient through labels
+                    t_n = n * self.dt
                     disc_n   = math.exp(-self.r * t_n)
                     disc_np1 = math.exp(-self.r * (t_n + self.dt))
-                    Y_n   = disc_n   * c_n.squeeze(1)     # (B,)
-                    Y_np1 = disc_np1 * c_np1.squeeze(1)   # (B,)
-                    F_n   = (Y_np1 - Y_n) / math.sqrt(self.dt)                                   # (B,)
 
-                    S_n     = S_batch[:, n, :].clamp_min(5e-4)
-                    S_np1   = S_batch[:, n+1, :] if n+1 < N else S_batch[:, n, :]
-                    sqrtV_n = torch.sqrt(V_batch[:, n, :].clamp_min(1e-12))
+                    Y_n_hat   = disc_n   * y_det[:, n, 0]                           # (B,)
+                    Y_np1_hat = disc_np1 * (y_det[:, n+1, 0] if n+1 < N else y_det[:, n, 0])
+                    F_n       = (Y_np1_hat - Y_n_hat) / math.sqrt(self.dt)          # (B,)
 
-                    dS_over_S = (S_np1 - S_n) / S_n                                                 # (B,d)
-                    Xn = ((dS_over_S - self.r * self.dt) / sqrtV_n) / math.sqrt(self.dt)           # (B,d)
+                    # standardized log-return shocks (X = L ε)
+                    S_n   = S_batch[:, n, :].clamp_min(5e-4)
+                    S_np1 = S_batch[:, n+1, :] if n+1 < N else S_batch[:, n, :]
+                    v_n   = V_batch[:, n, :].clamp_min(1e-12)
+                    sqrt_vn = torch.sqrt(v_n)
 
-                    alpha_c = _ridge_ols_alpha(F_n, Xn, ridge=1e-6)                                  # (d,)
-                    # whiten both sides with L_stock^T to match paper Z
-                    Zy = (alpha_y[:, n, :] @ self.L_stock.T)                                         # (B,d)
-                    Zc = alpha_c @ self.L_stock.T                                                    # (d,)
+                    log_ret = torch.log(S_np1 / S_n.clamp_min(1e-12))               # (B,d)
+                    drift   = (self.r - 0.5 * v_n) * self.dt
+                    Xn      = (log_ret - drift) / (sqrt_vn * math.sqrt(self.dt))    # (B,d)
 
-                    del_term = ((Zy - Zc.unsqueeze(0)).pow(2).sum(dim=1)).mean()
+                    alpha_c = _ridge_ols_alpha(F_n, Xn, ridge=1e-6)                 # (d,)
+                    # compare in whitened Z space: Z = α L^T
+                    Zy = (alpha_y[:, n, :] @ self.L_stock.T)                        # (B,d)
+                    Zc = alpha_c @ self.L_stock.T                                   # (d,)
+                    z_term = ((Zy - Zc.unsqueeze(0)).pow(2).sum(dim=1)).mean()
 
-                    # optional small Δ auxiliary loss (helps but not required)
+                    # optional small Δ auxiliary loss
                     if self.delta_aux_weight > 0:
                         dY_n = d_all[:, n, :].contiguous()
                         delta_aux = (dY_n - dC_n).pow(2).sum(dim=1).mean()
                     else:
                         delta_aux = torch.tensor(0.0, device=self.dev)
 
-                    loss_n = val_term \
-                           + self.z_weight * (self.dt / ((1.0 + self.r*self.dt) ** 2)) * del_term \
-                           + self.delta_aux_weight * delta_aux
+                    z_scale = self.z_weight * (self.dt / ((1.0 + self.r*self.dt) ** 2))
+                    loss_n = val_term + z_scale * z_term + self.delta_aux_weight * delta_aux
 
                     loss_sum += loss_n
                     val_sum  += val_term.item()
-                    del_sum  += del_term.item()
+                    del_sum  += z_term.item()
 
                 loss = loss_sum / N
                 self.opt.zero_grad(set_to_none=True)
@@ -443,7 +454,9 @@ class RNNAmericanHestonAlphaTrainer:
 
                 run_loss += loss.item(); run_val += val_sum / N; run_del += del_sum / N; nb += 1
 
-            print(f"Epoch {epoch:02d} | Loss {run_loss/nb:.6f} | Value {run_val/nb:.6f} | Z(stock) {run_del/nb:.6f} | Batches {nb}")
+            z_scaled = z_scale * z_term
+            print(f"Epoch {epoch:02d} | Loss {run_loss/nb:.6f} | Value {run_val/nb:.6f} | "
+                  f"Z(stock) {run_del/nb:.6f} (scaled {z_scaled:.3f}) | Batches {nb}")
             self.sched.step(run_loss/nb)
 
             # cache last epoch paths
@@ -479,10 +492,10 @@ class RNNAmericanHestonAlphaTrainer:
             h0_price = fT_k.view(1, b, 1).repeat(self.price_net.gru.num_layers, 1, self.price_net.gru.hidden_size)
             h0_delta = self.delta_h0_proj(gradT_k).unsqueeze(0).repeat(self.delta_net.gru.num_layers, 1, 1)
 
-            y_raw  = self.price_net(X_rev, h0=h0_price)
-            d_all  = self.delta_net(X_rev, h0=h0_delta)
-            alpha_y = self.alpha_net(X_rev) 
-            y_all  = y_raw
+            y_raw   = self.price_net(X_rev, h0=h0_price)
+            d_all   = self.delta_net(X_rev, h0=h0_delta)
+            alpha_y = self.alpha_net(X_rev)
+            y_all   = y_raw
 
             # delta β-blend
             n_idx = torch.arange(N, device=self.dev, dtype=S_batch.dtype)
@@ -512,10 +525,23 @@ class RNNAmericanHestonAlphaTrainer:
         alpha0_mean = alpha0_paths.mean(dim=0)  # (d,)
 
         # American value at t0
+        S0_t = torch.from_numpy(self.S0).float().to(self.dev)     # (d,)
+        v0_t = torch.from_numpy(self.v0).float().to(self.dev)     # (d,)
         S0_batch = torch.from_numpy(self.S0).float().unsqueeze(0).to(self.dev)
         f0       = payoff_arith(S0_batch, self.K, self.w, self.kind)[0]
         V0       = torch.maximum(f0, y0_mean)
-        return y0_mean.item(), V0.item(), delta0_mean.cpu().numpy(), alpha0_mean.cpu().numpy()
+
+        # Hedge at t0
+        if f0 >= y0_mean:
+            hedge_final = ( self.w if self.kind == "call" else -self.w ).cpu().numpy()
+            hedge_note  = "exercise-region hedge (payoff gradient)"
+        else:
+            # α is in stock-shock space X=Lε ⇒ h = α/(S√v) (elementwise)
+            h_alpha = self._alpha_to_shares(alpha0_mean, S0_t, v0_t)    # (d,)
+            hedge_final = h_alpha.cpu().numpy()
+            hedge_note  = "continuation-region hedge (h = α/(S√v))"
+
+        return y0_mean.item(), V0.item(), delta0_mean.cpu().numpy(), alpha0_mean.cpu().numpy(), hedge_final, hedge_note
 
     # ----- Save -----
     def save(self, path: str = "american_heston_alpha.pth"):
@@ -560,7 +586,7 @@ if __name__ == "__main__":
         corr=corr_matrix, kind="put", weights=weights,
         M=100000, batch_size=4096, epochs=30, seed=12345,
         hidden_dim=64, num_layers=3, lr=1e-3, grad_clip=1.0,
-        alpha_price=1.0, z_weight=1.0, beta=0.5, delta_aux_weight=0.02,
+        alpha_price=1.0, z_weight=1, beta=0.5, delta_aux_weight=0.0,
         smooth_labels=True, smooth_only_at_maturity=False,
         lookahead_window=None, shuffle=False, drop_last=True, resimulate_every=1
     )
@@ -573,11 +599,16 @@ if __name__ == "__main__":
     print(f"Strike: {trainer.K}")
     print(f"Correlation: {corr_matrix[0,1]:.2f} (off-diagonal)")
 
-    y0_cached, V0_cached, delta0_cached, alpha0_cached = trainer.price_at_t0(inference_batch_size=4096, use_cached_paths=True)
+    y0_cached, V0_cached, delta0_cached, alpha0_cached, hedge, note = trainer.price_at_t0(inference_batch_size=4096, use_cached_paths=True)
     print(f"\n--- Results ---")
     print("Cached paths -> t0 continuation:", round(y0_cached, 6))
     print("Cached paths -> t0 American   :", round(V0_cached, 6))
     print("Cached paths -> t0 deltas     :", np.round(delta0_cached, 6))
     print("Cached paths -> t0 alphas     :", np.round(alpha0_cached, 6))
+
+    print("\n--- Hedges at t0 ---")
+    print("Delta-only (ref):   ", np.round(delta0_cached, 6))
+    print("Alpha (driver):     ", np.round(alpha0_cached, 6))
+    print("Final shares:       ", np.round(hedge, 6), f"[{note}]")
 
     trainer.save()
