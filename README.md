@@ -42,24 +42,13 @@ Under **Heston** (incomplete market), delta alone is insufficient; we therefore 
 
 ## Quickstart
 
-### 1) Environment
-
-    python -m venv .venv
-    # Windows: .venv\Scripts\activate
-    # macOS/Linux:
-    source .venv/bin/activate
-    pip install --upgrade pip
-    pip install numpy torch pandas scipy scikit-learn matplotlib
-
-> GPU is auto-used if available (`torch.cuda.is_available()`).
-
-### 2) LSM baseline (GBM)
+### 1) LSM baseline (GBM)
 
     python longstaff_schwartz.py
 
 Produces an American price via polynomial regression on simulated **correlated GBM** paths.
 
-### 3) Deep RNN-BSDE (GBM)
+### 2) Deep RNN-BSDE (GBM)
 
     python rnn_model.py
 
@@ -67,7 +56,7 @@ Produces an American price via polynomial regression on simulated **correlated G
 - **DeltaGRU** learns \(\Delta_n\) (paper-style \(Z\) term)  
 - Labels from **batch-mean look-ahead**; maturity smoothing; sequence time-reversal for stability.
 
-### 4) Deep RNN-BSDE (Heston, with alpha driver)
+### 3) Deep RNN-BSDE (Heston, with alpha driver)
 
     python heston_rnn_model.py
 
@@ -81,81 +70,7 @@ Console output after training includes:
 - Average \(\Delta_0\) and average \(\alpha_0\)
 - Suggested **hedge vector** (exercise: payoff gradient; continuation: driver-to-shares mapping)
 
----
 
-## Using your own **Heston** parameters (calibration)
-
-### A) Run calibration
-
-Place your scripts in `calibration/` (or adapt paths). They should write:
-
-- `calibration/heston_parameters.csv`  
-  Columns per asset: `asset,v0,kappa,theta,sigma,rho_sv`
-
-- `calibration/heston_correlation_matrix.csv`  
-  A d×d CSV with ones on the diagonal and symmetric off-diagonals for **stock** correlations.
-
-### B) Wire into training
-
-In `heston_rnn_model.py`, either:
-- Load those CSVs (recommended), or
-- Paste arrays directly into the trainer (quick test).
-
-Training will:
-1. simulate **correlated Heston** paths with your parameters,  
-2. learn price + hedge heads,  
-3. save a checkpoint (e.g., `american_heston_alpha.pth`) for later inference.
-
----
-
-## How it works (succinct)
-
-### Look-ahead labels (batch-mean \(j^\*\))
-
-At step \(n\), pick a **single** \(j^\* \in \{n{+}1,\ldots,N\}\) maximizing **batch-mean discounted payoff**.  
-Define labels:
-\[
-c_n = e^{-r (t_{j^\*}-t_n)} f(S_{j^\*}),\qquad
-\nabla c_n \approx e^{-r(\cdot)} \nabla f(S_{j^\*}) \odot \frac{S_{j^\*}}{S_n}.
-\]
-These supervise the **value head** and (optionally) an auxiliary **delta head**.
-
-### Stock-driver \( \alpha \) (Heston)
-
-Discounted continuation increments satisfy a martingale representation. Regress the **per-path** increment
-\[
-F_n \;\approx\; \frac{e^{-rt_{n+1}}c_{n+1} - e^{-rt_n}c_n}{\sqrt{\Delta t}}
-\]
-on standardized stock shocks
-\[
-X_n \;=\; \frac{\Delta S_n/S_n - r\Delta t}{\sqrt{v_n}\sqrt{\Delta t}}.
-\]
-Batch ridge OLS (small \(\ell_2\)) yields an **alpha label** \( \alpha_c \in \mathbb{R}^d \).  
-The **AlphaGRU** outputs \( \alpha_y \) path-wise and is trained to match the **whitened** target
-\[
-Z^{(S)} = \alpha L^\top,
-\]
-where \(L\) is the Cholesky of the **stock correlation**. This matches the BSDE’s \(Z\) convention under correlated drivers.
-
-### Loss (per time step, averaged)
-
-\[
-\mathcal L \;=\; \underbrace{\mathbb E|c_n - y_n|^2}_{\text{value MSE}}
-\;+\; \lambda \,\underbrace{\mathbb E\| Z^{(S)}_{\text{label}} - Z^{(S)}_{\text{net}} \|^2}_{\text{driver MSE}}
-\;+\; \gamma \,\underbrace{\mathbb E\|\Delta_{\text{aux}} - \nabla c_n\|^2}_{\text{optional}}.
-\]
-
-- \( \lambda \) balances **units** (price vs driver). The raw BSDE scaling can under-weight the driver; here it is tunable.  
-- \( \gamma \) is a small auxiliary weight for delta stabilization.
-
-### Hedging (what you actually trade)
-
-- **Exercise region**: \(f(S_n)\ge y_n \Rightarrow\) hedge with the payoff gradient (arith. basket put: \(-w\)).  
-- **Continuation region**: map the learned driver to **shares**:  
-  1) compute \( \tilde h = \alpha \oslash (S \circ \sqrt{v}) \) (component-wise), then  
-  2) if using whitened targets, solve \(L^\top h = \tilde h\) for \(h\).
-
----
 
 ## Contact
 
