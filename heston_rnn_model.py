@@ -581,12 +581,12 @@ if __name__ == "__main__":
     v0 = 0.04; theta = 0.04; kappa_v = 1.5; vol_of_vol = 0.5; rho_sv = -0.5
 
     trainer = RNNAmericanHestonAlphaTrainer(
-        d=d, S0=S0_vector, K=120.0, r=0.1, T=0.5, N=126,
+        d=d, S0=S0_vector, K=120.0, r=0.05, T=0.5, N=126,
         v0=v0, theta=theta, kappa_v=kappa_v, vol_of_vol=vol_of_vol, rho_sv=rho_sv,
         corr=corr_matrix, kind="put", weights=weights,
         M=100000, batch_size=4096, epochs=30, seed=12345,
         hidden_dim=64, num_layers=3, lr=1e-3, grad_clip=1.0,
-        alpha_price=1.0, z_weight=1, beta=0.5, delta_aux_weight=0.0,
+        alpha_price=1.0, z_weight=1, beta=0.5, delta_aux_weight=max(0.001, 0.005*5/d),
         smooth_labels=True, smooth_only_at_maturity=False,
         lookahead_window=None, shuffle=False, drop_last=True, resimulate_every=1
     )
