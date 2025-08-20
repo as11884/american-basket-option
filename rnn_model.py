@@ -212,6 +212,10 @@ class RNNAmericanTrainer:
         self.dt = None
         self.cached_paths_cpu = None
         self._cached_paths_dev = None
+        
+        # Cache for price_at_all_time results to avoid redundant computation
+        self._cached_all_time_results = None
+        self._cached_all_time_params = None  # Store params used for cache validation
 
         set_seed(self.seed)
     
@@ -411,15 +415,33 @@ class RNNAmericanTrainer:
 
         return self
 
-    # ----- Inference at t0 -----
+    # ----- Inference for all time steps -----
     @torch.no_grad()
-    def price_at_t0(self, seed: int = 777, inference_batch_size: int | None = 1024, use_cached_paths: bool = False):
+    def price_at_all_time(self, seed: int = 777, inference_batch_size: int | None = 1024, use_cached_paths: bool = False):
         """
-        If use_cached_paths=True and cached paths exist, reuse last epoch's paths.
-        Set inference_batch_size=None to disable batching (single pass on all paths).
-        Returns: (y0_mean, V0, delta0_mean) - continuation value, American value, and delta at t0
+        Compute option prices and deltas for ALL time steps (0 to N-1).
+        Results are cached to avoid redundant computation when called multiple times with same parameters.
+        
+        Args:
+            seed: Random seed for path generation (if not using cached paths)
+            inference_batch_size: Batch size for inference (None = single pass)
+            use_cached_paths: Whether to use cached training paths
+            
+        Returns:
+            tuple: (y_all_mean, V_all, delta_all_mean)
+            - y_all_mean: Continuation values at all time steps (N,)
+            - V_all: American option values at all time steps (N,) 
+            - delta_all_mean: Deltas at all time steps (N, d)
         """
-        # select source
+        # Create cache key from parameters
+        cache_params = (seed, inference_batch_size, use_cached_paths)
+        
+        # Check if we have valid cached results
+        if (self._cached_all_time_results is not None and 
+            self._cached_all_time_params == cache_params):
+            return self._cached_all_time_results
+        
+        # Select source
         if use_cached_paths and (self.cached_paths_cpu is not None):
             S_paths_cpu = self.cached_paths_cpu  # (M, N+1, d) on CPU
         else:
@@ -457,33 +479,71 @@ class RNNAmericanTrainer:
             base_delta = Dn.view(1,N,1) * (gradT_k.view(b,1,d) * (batch_paths[:, N, :].view(b,1,d) / S_all_clamped))
             d_all = self.beta * d_all + (1.0 - self.beta) * base_delta
 
-            return y_all[:, 0, 0], d_all[:, 0, :]  # (b,), (b,d)
+            return y_all.squeeze(-1), d_all  # (b,N), (b,N,d) - ALL time steps
 
         if inference_batch_size is None:
-            y0_paths, delta0_paths = _eval_batch(S_paths_cpu.to(self.dev, non_blocking=True))
+            y_all_paths, delta_all_paths = _eval_batch(S_paths_cpu.to(self.dev, non_blocking=True))
         else:
-            y0_all = []
-            delta0_all = []
+            y_all_list = []
+            delta_all_list = []
             num_batches = (M + inference_batch_size - 1) // inference_batch_size
             for bidx in range(num_batches):
                 s = bidx * inference_batch_size
                 e = min((bidx + 1) * inference_batch_size, M)
                 batch_paths = S_paths_cpu[s:e].to(self.dev, non_blocking=True)
-                y0_batch, delta0_batch = _eval_batch(batch_paths)
-                y0_all.append(y0_batch)
-                delta0_all.append(delta0_batch)
-            y0_paths = torch.cat(y0_all, dim=0)
-            delta0_paths = torch.cat(delta0_all, dim=0)
+                y_batch, delta_batch = _eval_batch(batch_paths)
+                y_all_list.append(y_batch)
+                delta_all_list.append(delta_batch)
+            y_all_paths = torch.cat(y_all_list, dim=0)        # (M,N)
+            delta_all_paths = torch.cat(delta_all_list, dim=0) # (M,N,d)
 
-        y0_mean = y0_paths.mean()
-        delta0_mean = delta0_paths.mean(dim=0)  # (d,) - average delta across paths
+        # Average across paths
+        y_all_mean = y_all_paths.mean(dim=0)      # (N,) - continuation values at all times
+        delta_all_mean = delta_all_paths.mean(dim=0) # (N,d) - deltas at all times
 
-        # American value at t0 = max(f(S0), y0_mean)
-        S0_batch = torch.from_numpy(self.S0).float().unsqueeze(0).to(self.dev)  # (1, d)
-        f0       = payoff_arith(S0_batch, self.K, self.w, self.kind)[0]
-        V0       = torch.maximum(f0, y0_mean)
+        # Compute American values at all time steps: V_n = max(f(S_n), y_n)
+        V_all = torch.zeros(N, device=self.dev)
         
-        return y0_mean.item(), V0.item(), delta0_mean.cpu().numpy()
+        for n in range(N):
+            # Get average stock prices at time n across all paths
+            S_n_avg = S_paths_cpu[:, n, :].mean(dim=0).to(self.dev)  # (d,)
+            f_n = payoff_arith(S_n_avg.unsqueeze(0), self.K, self.w, self.kind)[0]
+            V_all[n] = torch.maximum(f_n, y_all_mean[n])
+        
+        # Convert to numpy and cache results
+        results = (y_all_mean.cpu().numpy(),    # (N,) continuation values
+                   V_all.cpu().numpy(),        # (N,) American values  
+                   delta_all_mean.cpu().numpy()) # (N,d) delta time series
+        
+        # Cache the results
+        self._cached_all_time_results = results
+        self._cached_all_time_params = cache_params
+        
+        return results
+
+    # ----- Helper: Extract t=0 results from full time series -----
+    def price_at_t0(self, seed: int = 777, inference_batch_size: int | None = 1024, use_cached_paths: bool = False):
+        """
+        Helper method that extracts t=0 results from the full time series.
+        Maintains backward compatibility with existing code.
+        
+        Returns: (y0_mean, V0, delta0_mean) - continuation value, American value, and delta at t0
+        """
+        y_all_mean, V_all, delta_all_mean = self.price_at_all_time(seed, inference_batch_size, use_cached_paths)
+        
+        # Extract t=0 results
+        y0_mean = y_all_mean[0]      # Continuation value at t=0
+        V0 = V_all[0]                # American value at t=0  
+        delta0_mean = delta_all_mean[0, :]  # Delta at t=0: (d,)
+        
+        return y0_mean, V0, delta0_mean
+
+    # ----- Cache management -----
+    def clear_inference_cache(self):
+        """Clear cached inference results to force recomputation."""
+        self._cached_all_time_results = None
+        self._cached_all_time_params = None
+        print("Inference cache cleared")
 
     # ----- Save -----
     def save(self, path: str = "american_arith_two_rnn_bsde.pth"):
