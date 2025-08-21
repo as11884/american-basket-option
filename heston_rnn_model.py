@@ -543,6 +543,110 @@ class RNNAmericanHestonAlphaTrainer:
 
         return y0_mean.item(), V0.item(), delta0_mean.cpu().numpy(), alpha0_mean.cpu().numpy(), hedge_final, hedge_note
 
+    def price_at_all_time(self, seed: int = 777, inference_batch_size: int | None = 1024, use_cached_paths: bool = False):
+        """
+        Compute option prices and deltas for ALL time steps (0 to N-1) in Heston model.
+        
+        Args:
+            seed: Random seed for path generation (if not using cached paths)
+            inference_batch_size: Batch size for inference (None = single pass)
+            use_cached_paths: Whether to use cached training paths
+            
+        Returns:
+            tuple: (y_all_mean, V_all, delta_all_mean)
+            - y_all_mean: Continuation values at all time steps (N,)
+            - V_all: American option values at all time steps (N,) 
+            - delta_all_mean: Deltas at all time steps (N, d)
+        """
+        # Check for cached results
+        cache_params = (seed, inference_batch_size, use_cached_paths)
+        if (hasattr(self, '_cached_all_time_results') and 
+            hasattr(self, '_cached_all_time_params') and
+            self._cached_all_time_results is not None and 
+            self._cached_all_time_params == cache_params):
+            return self._cached_all_time_results
+            
+        # Select paths
+        if use_cached_paths and (self.cached_paths_cpu is not None):
+            S_paths_cpu = self.cached_paths_cpu
+            V_paths_cpu = self.cached_var_cpu
+        else:
+            S_paths_dev, V_paths_dev, _ = self._simulate_paths(seed)
+            S_paths_cpu = S_paths_dev.to("cpu")
+            V_paths_cpu = V_paths_dev.to("cpu")
+
+        M, Np1, d = S_paths_cpu.shape
+        N = Np1 - 1
+        kappa_eff = float(max(2.0 / (self.T / self.N), 1.0))
+
+        def _eval_batch(S_batch, V_batch):
+            b = S_batch.shape[0]
+            S_all     = S_batch[:, :N, :]                    # (b,N,d)
+            sqrtV_all = torch.sqrt(V_batch[:, :N, :].clamp_min(0.0))  # (b,N,d)
+            G_all     = arithmetic_basket(S_all.reshape(-1, d), self.w).view(b, N, 1)
+            g_n       = (G_all - self.K) if self.kind == "call" else (self.K - G_all)
+            X_rev     = torch.cat([S_all.flip(1), sqrtV_all.flip(1), g_n.flip(1)], dim=2)
+
+            S_T = S_batch[:, N, :]
+            fT_k, gradT_k = smooth_payoff_and_grad(S_T, self.K, self.w, self.kind, kappa_eff)
+            h0_price = fT_k.view(1, b, 1).repeat(self.price_net.gru.num_layers, 1, self.price_net.gru.hidden_size)
+            h0_delta = self.delta_h0_proj(gradT_k).unsqueeze(0).repeat(self.delta_net.gru.num_layers, 1, 1)
+
+            y_raw   = self.price_net(X_rev, h0=h0_price)     # (b,N,1)
+            d_all   = self.delta_net(X_rev, h0=h0_delta)     # (b,N,d)
+            y_all   = y_raw  # no price blend for inference
+
+            # Delta β-blend (same as training)
+            n_idx = torch.arange(N, device=self.dev, dtype=S_batch.dtype)
+            Dn    = torch.exp(-self.r * (self.T - n_idx * self.dt))
+            S_all_clamped = S_all.clamp_min(5e-4)
+            base_delta = Dn.view(1,N,1) * (gradT_k.view(b,1,d) * (S_batch[:, N, :].view(b,1,d) / S_all_clamped))
+            d_all = self.beta * d_all + (1.0 - self.beta) * base_delta
+
+            return y_all.squeeze(-1), d_all  # (b,N), (b,N,d) - ALL time steps
+
+        # Process batches
+        if inference_batch_size is None:
+            y_all_paths, delta_all_paths = _eval_batch(S_paths_cpu.to(self.dev), V_paths_cpu.to(self.dev))
+        else:
+            y_all_list = []
+            delta_all_list = []
+            num_batches = (M + inference_batch_size - 1) // inference_batch_size
+            for bidx in range(num_batches):
+                s = bidx * inference_batch_size
+                e = min((bidx + 1) * inference_batch_size, M)
+                Sb = S_paths_cpu[s:e].to(self.dev, non_blocking=True)
+                Vb = V_paths_cpu[s:e].to(self.dev, non_blocking=True)
+                y_batch, delta_batch = _eval_batch(Sb, Vb)
+                y_all_list.append(y_batch)
+                delta_all_list.append(delta_batch)
+            y_all_paths = torch.cat(y_all_list, dim=0)        # (M,N)
+            delta_all_paths = torch.cat(delta_all_list, dim=0) # (M,N,d)
+
+        # Average across paths
+        y_all_mean = y_all_paths.mean(dim=0)      # (N,) - continuation values at all times
+        delta_all_mean = delta_all_paths.mean(dim=0) # (N,d) - deltas at all times
+
+        # Compute American values at all time steps: V_n = max(f(S_n), y_n)
+        V_all = torch.zeros(N, device=self.dev)
+        
+        for n in range(N):
+            # Get average stock prices at time n across all paths
+            S_n_avg = S_paths_cpu[:, n, :].mean(dim=0).to(self.dev)  # (d,)
+            f_n = payoff_arith(S_n_avg.unsqueeze(0), self.K, self.w, self.kind)[0]
+            V_all[n] = torch.maximum(f_n, y_all_mean[n])
+        
+        # Convert to numpy and cache results
+        results = (y_all_mean.cpu().numpy(),      # (N,) continuation values
+                   V_all.cpu().numpy(),          # (N,) American values  
+                   delta_all_mean.cpu().numpy()) # (N,d) delta time series
+        
+        # Cache the results
+        self._cached_all_time_results = results
+        self._cached_all_time_params = cache_params
+        
+        return results
+
     # ----- Save -----
     def save(self, path: str = "american_heston_alpha.pth"):
         torch.save({
