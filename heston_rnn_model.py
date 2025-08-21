@@ -583,7 +583,7 @@ class RNNAmericanHestonAlphaTrainer:
         return y0_mean, V0, delta0_mean, alpha0_mean, hedge_final, hedge_note
 
     # ----- Save -----
-    def save(self, path: str = "american_heston_alpha.pth"):
+    def save(self, path: str = "data/american_heston_alpha.pth"):
         torch.save({
             "price_net": self.price_net.state_dict(),
             "delta_net": self.delta_net.state_dict(),
