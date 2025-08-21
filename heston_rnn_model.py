@@ -465,87 +465,11 @@ class RNNAmericanHestonAlphaTrainer:
 
         return self
 
-    # ----- Inference at t0 -----
-    @torch.no_grad()
-    def price_at_t0(self, seed: int = 777, inference_batch_size: int | None = 1024, use_cached_paths: bool = False):
-        if use_cached_paths and (self.cached_paths_cpu is not None):
-            S_paths_cpu = self.cached_paths_cpu
-            V_paths_cpu = self.cached_var_cpu
-        else:
-            S_paths_dev, V_paths_dev, _ = self._simulate_paths(seed)
-            S_paths_cpu = S_paths_dev.to("cpu"); V_paths_cpu = V_paths_dev.to("cpu")
-
-        M, Np1, d = S_paths_cpu.shape
-        N = Np1 - 1
-        kappa_eff = float(max(2.0 / (self.T / self.N), 1.0))
-
-        def _eval_batch(S_batch, V_batch):
-            b = S_batch.shape[0]
-            S_all     = S_batch[:, :N, :]
-            sqrtV_all = torch.sqrt(V_batch[:, :N, :].clamp_min(0.0))
-            G_all     = arithmetic_basket(S_all.reshape(-1, d), self.w).view(b, N, 1)
-            g_n       = (G_all - self.K) if self.kind == "call" else (self.K - G_all)
-            X_rev     = torch.cat([S_all.flip(1), sqrtV_all.flip(1), g_n.flip(1)], dim=2)
-
-            S_T = S_batch[:, N, :]
-            fT_k, gradT_k = smooth_payoff_and_grad(S_T, self.K, self.w, self.kind, kappa_eff)
-            h0_price = fT_k.view(1, b, 1).repeat(self.price_net.gru.num_layers, 1, self.price_net.gru.hidden_size)
-            h0_delta = self.delta_h0_proj(gradT_k).unsqueeze(0).repeat(self.delta_net.gru.num_layers, 1, 1)
-
-            y_raw   = self.price_net(X_rev, h0=h0_price)
-            d_all   = self.delta_net(X_rev, h0=h0_delta)
-            alpha_y = self.alpha_net(X_rev)
-            y_all   = y_raw
-
-            # delta β-blend
-            n_idx = torch.arange(N, device=self.dev, dtype=S_batch.dtype)
-            Dn    = torch.exp(-self.r * (self.T - n_idx * self.dt))
-            S_all_clamped = S_all.clamp_min(5e-4)
-            base_delta = Dn.view(1,N,1) * (gradT_k.view(b,1,d) * (S_batch[:, N, :].view(b,1,d) / S_all_clamped))
-            d_all = self.beta * d_all + (1.0 - self.beta) * base_delta
-
-            return y_all[:, 0, 0], d_all[:, 0, :], alpha_y[:, 0, :]
-
-        if inference_batch_size is None:
-            y0_paths, delta0_paths, alpha0_paths = _eval_batch(S_paths_cpu.to(self.dev), V_paths_cpu.to(self.dev))
-        else:
-            y_list, d_list, a_list = [], [], []
-            num_batches = (M + inference_batch_size - 1) // inference_batch_size
-            for bidx in range(num_batches):
-                s = bidx * inference_batch_size
-                e = min((bidx + 1) * inference_batch_size, M)
-                Sb = S_paths_cpu[s:e].to(self.dev, non_blocking=True)
-                Vb = V_paths_cpu[s:e].to(self.dev, non_blocking=True)
-                yb, db, ab = _eval_batch(Sb, Vb)
-                y_list.append(yb); d_list.append(db); a_list.append(ab)
-            y0_paths = torch.cat(y_list, dim=0); delta0_paths = torch.cat(d_list, dim=0); alpha0_paths = torch.cat(a_list, dim=0)
-
-        y0_mean = y0_paths.mean()
-        delta0_mean = delta0_paths.mean(dim=0)  # (d,)
-        alpha0_mean = alpha0_paths.mean(dim=0)  # (d,)
-
-        # American value at t0
-        S0_t = torch.from_numpy(self.S0).float().to(self.dev)     # (d,)
-        v0_t = torch.from_numpy(self.v0).float().to(self.dev)     # (d,)
-        S0_batch = torch.from_numpy(self.S0).float().unsqueeze(0).to(self.dev)
-        f0       = payoff_arith(S0_batch, self.K, self.w, self.kind)[0]
-        V0       = torch.maximum(f0, y0_mean)
-
-        # Hedge at t0
-        if f0 >= y0_mean:
-            hedge_final = ( self.w if self.kind == "call" else -self.w ).cpu().numpy()
-            hedge_note  = "exercise-region hedge (payoff gradient)"
-        else:
-            # α is in stock-shock space X=Lε ⇒ h = α/(S√v) (elementwise)
-            h_alpha = self._alpha_to_shares(alpha0_mean, S0_t, v0_t)    # (d,)
-            hedge_final = h_alpha.cpu().numpy()
-            hedge_note  = "continuation-region hedge (h = α/(S√v))"
-
-        return y0_mean.item(), V0.item(), delta0_mean.cpu().numpy(), alpha0_mean.cpu().numpy(), hedge_final, hedge_note
+    # ----- Inference using price_at_all_time (NEW APPROACH) -----
 
     def price_at_all_time(self, seed: int = 777, inference_batch_size: int | None = 1024, use_cached_paths: bool = False):
         """
-        Compute option prices and deltas for ALL time steps (0 to N-1) in Heston model.
+        Compute option prices, deltas, and alphas for ALL time steps (0 to N-1) in Heston model.
         
         Args:
             seed: Random seed for path generation (if not using cached paths)
@@ -553,10 +477,11 @@ class RNNAmericanHestonAlphaTrainer:
             use_cached_paths: Whether to use cached training paths
             
         Returns:
-            tuple: (y_all_mean, V_all, delta_all_mean)
+            tuple: (y_all_mean, V_all, delta_all_mean, alpha_all_mean)
             - y_all_mean: Continuation values at all time steps (N,)
             - V_all: American option values at all time steps (N,) 
             - delta_all_mean: Deltas at all time steps (N, d)
+            - alpha_all_mean: Alphas (volatility hedges) at all time steps (N, d)
         """
         # Check for cached results
         cache_params = (seed, inference_batch_size, use_cached_paths)
@@ -594,6 +519,7 @@ class RNNAmericanHestonAlphaTrainer:
 
             y_raw   = self.price_net(X_rev, h0=h0_price)     # (b,N,1)
             d_all   = self.delta_net(X_rev, h0=h0_delta)     # (b,N,d)
+            alpha_all = self.alpha_net(X_rev)                # (b,N,d) - Alpha network output
             y_all   = y_raw  # no price blend for inference
 
             # Delta β-blend (same as training)
@@ -603,29 +529,33 @@ class RNNAmericanHestonAlphaTrainer:
             base_delta = Dn.view(1,N,1) * (gradT_k.view(b,1,d) * (S_batch[:, N, :].view(b,1,d) / S_all_clamped))
             d_all = self.beta * d_all + (1.0 - self.beta) * base_delta
 
-            return y_all.squeeze(-1), d_all  # (b,N), (b,N,d) - ALL time steps
+            return y_all.squeeze(-1), d_all, alpha_all  # (b,N), (b,N,d), (b,N,d) - ALL time steps
 
         # Process batches
         if inference_batch_size is None:
-            y_all_paths, delta_all_paths = _eval_batch(S_paths_cpu.to(self.dev), V_paths_cpu.to(self.dev))
+            y_all_paths, delta_all_paths, alpha_all_paths = _eval_batch(S_paths_cpu.to(self.dev), V_paths_cpu.to(self.dev))
         else:
             y_all_list = []
             delta_all_list = []
+            alpha_all_list = []
             num_batches = (M + inference_batch_size - 1) // inference_batch_size
             for bidx in range(num_batches):
                 s = bidx * inference_batch_size
                 e = min((bidx + 1) * inference_batch_size, M)
                 Sb = S_paths_cpu[s:e].to(self.dev, non_blocking=True)
                 Vb = V_paths_cpu[s:e].to(self.dev, non_blocking=True)
-                y_batch, delta_batch = _eval_batch(Sb, Vb)
+                y_batch, delta_batch, alpha_batch = _eval_batch(Sb, Vb)
                 y_all_list.append(y_batch)
                 delta_all_list.append(delta_batch)
+                alpha_all_list.append(alpha_batch)
             y_all_paths = torch.cat(y_all_list, dim=0)        # (M,N)
             delta_all_paths = torch.cat(delta_all_list, dim=0) # (M,N,d)
+            alpha_all_paths = torch.cat(alpha_all_list, dim=0) # (M,N,d)
 
         # Average across paths
         y_all_mean = y_all_paths.mean(dim=0)      # (N,) - continuation values at all times
         delta_all_mean = delta_all_paths.mean(dim=0) # (N,d) - deltas at all times
+        alpha_all_mean = alpha_all_paths.mean(dim=0) # (N,d) - alphas at all times
 
         # Compute American values at all time steps: V_n = max(f(S_n), y_n)
         V_all = torch.zeros(N, device=self.dev)
@@ -639,7 +569,8 @@ class RNNAmericanHestonAlphaTrainer:
         # Convert to numpy and cache results
         results = (y_all_mean.cpu().numpy(),      # (N,) continuation values
                    V_all.cpu().numpy(),          # (N,) American values  
-                   delta_all_mean.cpu().numpy()) # (N,d) delta time series
+                   delta_all_mean.cpu().numpy(), # (N,d) delta time series
+                   alpha_all_mean.cpu().numpy()) # (N,d) alpha time series
         
         # Cache the results
         self._cached_all_time_results = results
@@ -647,8 +578,33 @@ class RNNAmericanHestonAlphaTrainer:
         
         return results
 
+    # ----- Helper: Extract t=0 results from full time series -----
+    def price_at_t0(self, seed: int = 777, inference_batch_size: int | None = 1024, use_cached_paths: bool = False):
+        """
+        Helper method that extracts t=0 results from the full time series.
+        Matches the interface pattern of regular RNN model.
+        
+        Returns: (y0_mean, V0, delta0_mean, alpha0_mean) - continuation value, American value, delta and alpha at t0
+        """
+        y_all_mean, V_all, delta_all_mean, alpha_all_mean = self.price_at_all_time(seed, inference_batch_size, use_cached_paths)
+        
+        # Extract t=0 results
+        y0_mean = y_all_mean[0]      # Continuation value at t=0
+        V0 = V_all[0]                # American value at t=0  
+        delta0_mean = delta_all_mean[0, :]  # Delta at t=0: (d,)
+        alpha0_mean = alpha_all_mean[0, :]  # Alpha at t=0: (d,)
+        
+        return y0_mean, V0, delta0_mean, alpha0_mean
+
+    # ----- Cache management -----
+    def clear_inference_cache(self):
+        """Clear cached inference results to force recomputation."""
+        self._cached_all_time_results = None
+        self._cached_all_time_params = None
+        print("Inference cache cleared")
+
     # ----- Save -----
-    def save(self, path: str = "american_heston_alpha.pth"):
+    def save(self, path: str = "data/american_heston_alpha.pth"):
         torch.save({
             "price_net": self.price_net.state_dict(),
             "delta_net": self.delta_net.state_dict(),
@@ -688,13 +644,14 @@ if __name__ == "__main__":
         d=d, S0=S0_vector, K=120.0, r=0.05, T=0.5, N=126,
         v0=v0, theta=theta, kappa_v=kappa_v, vol_of_vol=vol_of_vol, rho_sv=rho_sv,
         corr=corr_matrix, kind="put", weights=weights,
-        M=100000, batch_size=4096, epochs=30, seed=12345,
+        M=10000, batch_size=4096, epochs=15, seed=12345,  # Reduced for demo
         hidden_dim=64, num_layers=3, lr=1e-3, grad_clip=1.0,
-        alpha_price=1.0, z_weight=1, beta=0.5, delta_aux_weight=max(0.001, 0.005*5/d),
+        alpha_price=1.0, z_weight=1, beta=0.5, delta_aux_weight=0.001,
         smooth_labels=True, smooth_only_at_maturity=False,
         lookahead_window=None, shuffle=False, drop_last=True, resimulate_every=1
     )
 
+    print(f"\n--- Training Heston RNN Model ---")
     trainer.train()
 
     print(f"\n--- Setup ---")
@@ -703,16 +660,39 @@ if __name__ == "__main__":
     print(f"Strike: {trainer.K}")
     print(f"Correlation: {corr_matrix[0,1]:.2f} (off-diagonal)")
 
-    y0_cached, V0_cached, delta0_cached, alpha0_cached, hedge, note = trainer.price_at_t0(inference_batch_size=4096, use_cached_paths=True)
-    print(f"\n--- Results ---")
-    print("Cached paths -> t0 continuation:", round(y0_cached, 6))
-    print("Cached paths -> t0 American   :", round(V0_cached, 6))
-    print("Cached paths -> t0 deltas     :", np.round(delta0_cached, 6))
-    print("Cached paths -> t0 alphas     :", np.round(alpha0_cached, 6))
+    # Use the new consistent interface
+    print(f"\n--- Results (t=0 only) ---")
+    y0, V0, delta0, alpha0 = trainer.price_at_t0(inference_batch_size=4096, use_cached_paths=True)
+    print("t=0 continuation value:", round(y0, 6))
+    print("t=0 American value   :", round(V0, 6))
+    print("t=0 deltas           :", np.round(delta0, 6))
+    print("t=0 alphas           :", np.round(alpha0, 6))
 
-    print("\n--- Hedges at t0 ---")
-    print("Delta-only (ref):   ", np.round(delta0_cached, 6))
-    print("Alpha (driver):     ", np.round(alpha0_cached, 6))
-    print("Final shares:       ", np.round(hedge, 6), f"[{note}]")
+    print(f"\n--- Full Time Series Results ---")
+    y_all, V_all, delta_all, alpha_all = trainer.price_at_all_time(inference_batch_size=4096, use_cached_paths=True)
+    print(f"Continuation values shape: {y_all.shape}")      # (N,)
+    print(f"American values shape: {V_all.shape}")         # (N,)
+    print(f"Delta time series shape: {delta_all.shape}")   # (N, d)
+    print(f"Alpha time series shape: {alpha_all.shape}")   # (N, d)
+    
+    print(f"\nFirst 5 time steps:")
+    for n in range(min(5, len(y_all))):
+        print(f"  t={n}: V={V_all[n]:.4f}, y={y_all[n]:.4f}, delta_sum={delta_all[n].sum():.4f}, alpha_sum={alpha_all[n].sum():.4f}")
+
+    print(f"\n--- Hedge Analysis ---")
+    # Calculate hedge ratios from alpha using the conversion formula
+    S0_t = torch.from_numpy(trainer.S0).float()
+    v0_t = torch.from_numpy(trainer.v0).float()
+    
+    # Convert alpha to hedge shares: h = alpha / (S * sqrt(v))
+    alpha0_tensor = torch.from_numpy(alpha0).float()
+    hedge_shares = trainer._alpha_to_shares(alpha0_tensor, S0_t, v0_t).numpy()
+    
+    print("Delta hedges (t=0):  ", np.round(delta0, 6))
+    print("Alpha coeffs (t=0):  ", np.round(alpha0, 6))
+    print("Alpha hedge shares:  ", np.round(hedge_shares, 6))
+    print("Portfolio delta sum: ", round(delta0.sum(), 6))
+    print("Portfolio alpha sum: ", round(alpha0.sum(), 6))
 
     trainer.save()
+    print(f"\nModel saved. Cache can be cleared with trainer.clear_inference_cache()")

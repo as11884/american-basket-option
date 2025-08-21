@@ -546,7 +546,7 @@ class RNNAmericanTrainer:
         print("Inference cache cleared")
 
     # ----- Save -----
-    def save(self, path: str = "american_arith_two_rnn_bsde.pth"):
+    def save(self, path: str = "data/american_arith_two_rnn_bsde.pth"):
         torch.save({
             "price_net": self.price_net.state_dict(),
             "delta_net": self.delta_net.state_dict(),

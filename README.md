@@ -20,11 +20,16 @@ This repo is designed to be **reproducible** and **readable** for graduate-level
 - **Longstaff–Schwartz MC baseline** — `longstaff_schwartz.py`  
   Correlated GBM LSM for sanity checks and benchmarking.
 
-- **Calibration (Heston)** — `calibration/`  
+- **Calibration (Heston)** — `heston_calib/`  
   Scripts to fit per-asset Heston parameters \((\kappa,\theta,\sigma,v_0,\rho_{sv})\) and the **stock correlation** matrix.  
-  Expected CSV outputs (consumed by the Heston trainer):
-  - `heston_parameters.csv`  (columns: `asset,v0,kappa,theta,sigma,rho_sv`)
-  - `heston_correlation_matrix.csv`  (d×d, symmetric, ones on diagonal)
+  Expected CSV outputs (consumed by the Heston trainer, stored in `data/`):
+  - `data/heston_parameters.csv`  (columns: `Ticker,Spot_Price,v0,kappa,theta,sigma,rho`)
+  - `data/heston_correlation_matrix.csv`  (d×d, symmetric, ones on diagonal)
+
+- **Data** — `data/`
+  Storage for model files (.pth) and calibrated data (CSV files):
+  - Model checkpoints: `american_heston_alpha.pth`, `american_arith_two_rnn_bsde.pth`, etc.
+  - Calibrated parameters: `heston_parameters.csv`, `heston_correlation_matrix.csv`
 
 - **Reference** — `Efficient pricing and hedging of high-dimensional American options using deep recurrent networks.pdf` (paper for the GBM case).
 

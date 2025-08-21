@@ -202,13 +202,13 @@ def main():
             columns=successful_tickers
         )
     
-    # Save files with clean names
-    raw_params_df.to_csv('heston_parameters.csv', index=False)
-    stock_corr_df.to_csv('heston_correlation_matrix.csv')
+    # Save files with clean names to data directory
+    raw_params_df.to_csv('data/heston_parameters.csv', index=False)
+    stock_corr_df.to_csv('data/heston_correlation_matrix.csv')
 
     print(f"RESULTS SAVED:")
-    print(f"• Heston Parameters: heston_parameters.csv")
-    print(f"• Stock Correlation Matrix: heston_correlation_matrix.csv")
+    print(f"• Heston Parameters: data/heston_parameters.csv")
+    print(f"• Stock Correlation Matrix: data/heston_correlation_matrix.csv")
     print(f"• Total successful calibrations: {len(successful)}")
 
 if __name__ == "__main__":
