@@ -676,92 +676,56 @@ class LSMOptionPricer:
 # ---------------------------
 
 if __name__ == "__main__":
-    # Parameters with ASYMMETRIC setup to show varied deltas
-    n_assets = 5
-    S0 = np.array([90.0, 95.0, 100.0, 105.0, 110.0])  # Different initial prices
+    # Basic parameters - 15 assets
+    n_assets = 15
+    S0 = np.array([85, 90, 95, 100, 105, 110, 115, 120, 80, 125, 130, 75, 135, 140, 145])
     r = 0.1
     T = 0.5
     step = 126
-    N_train = 50000  # Reduced for faster demo
-    N_test = 10000
-    K = 100.0
-    weights = np.array([0.3, 0.25, 0.2, 0.15, 0.1])  # Different weights
+    N = 50000
+    K = 150.0
+    # Equal weights for simplicity
+    weights = np.full(n_assets, 1.0 / n_assets)
 
-    # Lower correlation to reduce co-movement
+    print("BASKET AMERICAN PUT OPTION PRICES (15 assets)")
+    print("=" * 55)
+
+    # GBM model
     sig = 0.2
-    corr = 0.15  # Reduced from 0.30 to 0.15
+    corr = 0.15
     cov = np.full((n_assets, n_assets), corr * sig * sig)
     np.fill_diagonal(cov, sig * sig)
 
-    print("Out-of-Sample LSM Testing for American PUT (geometric basket)")
-    print(f"Initial prices: {S0}")
-    print(f"Weights: {weights}")
-    print(f"Strike: K={K}, T={T}, r={r}, Correlation: {corr}")
-    print(f"Training paths: {N_train}, Test paths per batch: {N_test}")
-    print("=" * 72)
-
-    pricer = LSMOptionPricer(
-        S0=S0, T=T, step=step, N=N_train, r=r, K=K,
-        weights=weights,
-        option="put",
-        model="gbm",
-        basket_kind="geometric",
-        include_variance_state=False,   # (ignored for GBM)
-        degree=2,  # Use degree 2 polynomial for this demo
-        cov=cov
+    gbm_pricer = LSMOptionPricer(
+        S0=S0, T=T, step=step, N=N, r=r, K=K,
+        weights=weights, option="put", model="gbm",
+        basket_kind="geometric", degree=2, cov=cov
     )
+    gbm_price, _, _ = gbm_pricer.price(seed=12345)
 
-    # Train (use a fixed seed for reproducibility)
-    train_seed = 12345
-    training_price, training_std, training_se = pricer.train(
-        use_individual_prices=True,
-        seed=train_seed
+    # Heston with variance state (only this variant)
+    v0 = np.array([0.04, 0.05, 0.03, 0.06, 0.045, 0.035, 0.055, 0.038, 0.042, 0.048, 
+                   0.052, 0.032, 0.058, 0.044, 0.050])
+    theta = np.array([0.04, 0.05, 0.03, 0.06, 0.045, 0.035, 0.055, 0.038, 0.042, 0.048,
+                      0.052, 0.032, 0.058, 0.044, 0.050])
+    kappa = np.array([2.0, 1.5, 2.5, 1.8, 2.2, 1.9, 2.3, 2.1, 1.7, 2.4,
+                      1.6, 2.6, 1.4, 2.7, 2.0])
+    sigma_v = np.array([0.30, 0.40, 0.25, 0.35, 0.30, 0.32, 0.38, 0.28, 0.42, 0.26,
+                        0.36, 0.24, 0.44, 0.34, 0.31])
+    rho_sv = np.array([-0.7, -0.6, -0.8, -0.65, -0.75, -0.68, -0.72, -0.63, -0.78, -0.67,
+                       -0.73, -0.62, -0.76, -0.69, -0.74])
+    corr_matrix = np.full((n_assets, n_assets), corr)
+    np.fill_diagonal(corr_matrix, 1.0)
+
+    heston_var_pricer = LSMOptionPricer(
+        S0=S0, T=T, step=step, N=N, r=r, K=K,
+        weights=weights, option="put", model="heston",
+        basket_kind="geometric", include_variance_state=True, degree=2,
+        v0=v0, theta=theta, kappa=kappa, sigma=sigma_v, rho_sv=rho_sv,
+        corr_matrix=corr_matrix
     )
-    print(f"Training:  {training_price:.4f}  ± {training_se:.4f}  (SE),  STD={training_std:.4f}")
-    
-    # European option price for comparison (same paths)
-    euro_payoff = pricer.payoff[:, -1]  # Payoff at maturity
-    euro_prices = euro_payoff * np.exp(-r * T)  # Discount to t=0
-    euro_price = float(np.mean(euro_prices))
-    print(f"European:  {euro_price:.4f}")
+    heston_var_price, _, _ = heston_var_pricer.price(seed=12345)
 
-    # Out-of-sample batches with distinct seeds
-    seeds = [101, 202, 303, 404, 505]
-    exceed_2se = 0
-    test_prices = []
-
-    print("Out-of-sample batches:")
-    for i, sd in enumerate(seeds, 1):
-        tp, tstd, tse = pricer.test(n_test_paths=N_test, seed=sd)
-        test_prices.append(tp)
-        diff = tp - training_price
-        flag = abs(diff) > 2.0 * np.sqrt(training_se**2 + tse**2)
-        exceed_2se += int(flag)
-        mark = " **" if flag else ""
-        print(f"  Batch {i}: {tp:.4f}  ± {tse:.4f} (SE),  Δ={diff:+.4f}{mark}")
-
-    mean_test = float(np.mean(test_prices))
-    bias = mean_test - training_price
-    print("-" * 72)
-    print(f"Mean OOS: {mean_test:.4f}, Bias (mean_oos - train): {bias:+.4f}")
-    print(f"Share of batches where |Δ| > 2 × SE_test: {exceed_2se}/{len(seeds)}")
-    
-    # Calculate deltas using finite differences
-    print("\n" + "=" * 72)
-    print("DELTA CALCULATION (Finite Differences)")
-    print("=" * 72)
-    
-    # Use the trained model for delta calculation (same seed for consistency)
-    deltas, base_price = pricer.delta(
-        bump_size=0.01,  # 1% relative bump
-        use_relative_bump=True,
-        seed=train_seed  # Use same seed as training for consistency
-    )
-    
-    print(f"Base price: {base_price:.6f}")
-    print(f"Deltas (1% bump):")
-    for i, (s0, w, delta) in enumerate(zip(S0, weights, deltas)):
-        print(f"  Asset {i+1}: S0={s0:6.1f}, weight={w:5.3f}, delta={delta:8.6f}")
-    
-    print(f"\nSum of weighted deltas: {np.sum(deltas * weights):.6f}")
-    print(f"Portfolio delta (basket): {np.sum(deltas * weights):.6f}")
+    print(f"GBM:                    {gbm_price:.6f}")
+    print(f"Heston (with var state): {heston_var_price:.6f}")
+    print(f"Price difference:       {heston_var_price - gbm_price:+.6f}")

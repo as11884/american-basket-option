@@ -323,12 +323,14 @@ class RNNAmericanTrainer:
     def train(self):
         for epoch in range(1, self.epochs + 1):
 
-            # (Re)simulate paths every resim_every epochs; otherwise reuse device cache
+            # (Re)simulate paths every resim_every epochs; otherwise reuse CPU cache
             if (epoch - 1) % self.resim_every == 0 or (self._cached_paths_dev is None):
                 S_paths, self.L_vol, self.dt = self._simulate_paths(self.seed + epoch)
-                self._cached_paths_dev = S_paths
+                # Cache on CPU to avoid GPU OOM for large M
+                self._cached_paths_dev = S_paths.detach().cpu()
             else:
-                S_paths = self._cached_paths_dev  # reuse
+                # Move cached paths back to GPU when needed
+                S_paths = self._cached_paths_dev.to(self.dev)
 
             loader = self._make_loader(S_paths)
 
@@ -412,6 +414,8 @@ class RNNAmericanTrainer:
 
             # cache this epoch's paths to CPU for later reuse in inference
             self.cached_paths_cpu = S_paths.detach().to("cpu")
+            # Clear GPU cache to free memory after training
+            self._cached_paths_dev = None
 
         return self
 
@@ -433,14 +437,6 @@ class RNNAmericanTrainer:
             - V_all: American option values at all time steps (N,) 
             - delta_all_mean: Deltas at all time steps (N, d)
         """
-        # Create cache key from parameters
-        cache_params = (seed, inference_batch_size, use_cached_paths)
-        
-        # Check if we have valid cached results
-        if (self._cached_all_time_results is not None and 
-            self._cached_all_time_params == cache_params):
-            return self._cached_all_time_results
-        
         # Select source
         if use_cached_paths and (self.cached_paths_cpu is not None):
             S_paths_cpu = self.cached_paths_cpu  # (M, N+1, d) on CPU
@@ -510,14 +506,10 @@ class RNNAmericanTrainer:
             f_n = payoff_arith(S_n_avg.unsqueeze(0), self.K, self.w, self.kind)[0]
             V_all[n] = torch.maximum(f_n, y_all_mean[n])
         
-        # Convert to numpy and cache results
+        # Convert to numpy
         results = (y_all_mean.cpu().numpy(),    # (N,) continuation values
                    V_all.cpu().numpy(),        # (N,) American values  
                    delta_all_mean.cpu().numpy()) # (N,d) delta time series
-        
-        # Cache the results
-        self._cached_all_time_results = results
-        self._cached_all_time_params = cache_params
         
         return results
 
@@ -539,12 +531,6 @@ class RNNAmericanTrainer:
         return y0_mean, V0, delta0_mean
 
     # ----- Cache management -----
-    def clear_inference_cache(self):
-        """Clear cached inference results to force recomputation."""
-        self._cached_all_time_results = None
-        self._cached_all_time_params = None
-        print("Inference cache cleared")
-
     # ----- Save -----
     def save(self, path: str = "data/american_arith_two_rnn_bsde.pth"):
         torch.save({
