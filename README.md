@@ -23,11 +23,9 @@ american-basket-option/
 ├─ data/                         # Model checkpoints & calibrated CSVs (gitignored)
 ├─ heston_calib/                 # Heston calibration helpers + scripts
 ├─ results_notebook/             # Result exploration / plotting utilities
-├─ Efficient pricing and hedging of high-dimensional American options using deep recurrent networks.pdf
-├─ heston_calibrator_top30.py    # Example calibration driver
-├─ longstaff_schwartz.py         # Correlated-GBM LSMC baseline
-├─ rnn_model.py                  # GBM RNN-BSDE (price + delta)
-├─ gbm_rnn_model.py              # Alternate GBM model (optional)
+├─ heston_calibrator_top30.py    
+├─ longstaff_schwartz.py         # LSMC baseline
+├─ gbm_rnn_model.py              # GBM RNN-BSDE (price + delta)
 ├─ heston_rnn_model.py           # Heston RNN-BSDE (price + delta + alpha)
 ├─ __init__.py
 ├─ README.md
