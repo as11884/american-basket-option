@@ -1,23 +1,4 @@
-#!/usr/bin/env python3
-"""
-Simple Multi-Stock Heston Calibration
-=====================================
-
-A streamlined version for quick multi-stock calibration with
-easy customization and clear output.
-
-Usage:
-    python simple_multi_stock.py
-
-Features:
-- Parallel calibration of multiple stocks
-- Clear progress reporting  
-- Automatic result export
-- Parameter comparison table
-"""
-
-import sys
-import os
+import sysimport os
 import numpy as np
 import pandas as pd
 import warnings
